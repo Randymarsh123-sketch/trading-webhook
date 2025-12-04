@@ -100,15 +100,26 @@ Svar KUN med gyldig JSON på dette formatet:
       analysis = { raw: content };
     }
 
-    console.log("SMC analysis:", analysis);
+    // ---------------------------
+    // 4) FILTRERING: signal vs ikke-signal
+    // ---------------------------
+    const eventType = analysis?.event || "none";
+    const isSignal = eventType && eventType !== "none";
+
+    if (isSignal) {
+      console.log("SMC SIGNAL:", analysis);
+    } else {
+      console.log("SMC no signal this candle.");
+    }
 
     // ---------------------------
-    // 4) Send svar tilbake
+    // 5) Send svar tilbake
     // ---------------------------
     return response.status(200).json({
       ok: true,
+      signal: isSignal,
       received: data,
-      analysis
+      analysis: isSignal ? analysis : null
     });
 
   } catch (err) {
