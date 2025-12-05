@@ -1,35 +1,56 @@
 // api/webhook.js
 
+// -------------------------------
+// HJELPER: sjekk om vi er i London-vinduet
+// London-session: ca 09:00–13:59 (CET)
+// Vi bruker serverens UTC-tid og legger til +1 time
+// (kan finjusteres etter behov).
+// -------------------------------
+function isInLondonHours() {
+  const now = new Date();
+
+  // Justering: UTC + 1 = ca. CET.
+  const hour = now.getUTCHours() + 1;
+
+  // 09:00 <= time < 14:00
+  return hour >= 9 && hour < 14;
+}
+
+// -------------------------------
+// HJELPER: send melding til Telegram
+// -------------------------------
+async function sendTelegramMessage(message) {
+  const token = process.env.TELEGRAM_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    console.error("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID");
+    return;
+  }
+
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown"
+      })
+    });
+  } catch (err) {
+    console.error("Error sending Telegram message:", err);
+  }
+}
+
+// -------------------------------
+// HOVEDHANDLER
+// -------------------------------
 export default async function handler(request, response) {
   if (request.method !== "POST") {
     return response.status(405).json({ error: "Only POST allowed" });
-  }
-
-  // --- Helper: send Telegram message ---
-  async function sendTelegram(message) {
-    const token = process.env.TELEGRAM_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
-
-    if (!token || !chatId) {
-      console.error("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID");
-      return;
-    }
-
-    const url = `https://api.telegram.org/bot${token}/sendMessage`;
-
-    try {
-      await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: message,
-          parse_mode: "Markdown"
-        })
-      });
-    } catch (err) {
-      console.error("Error sending Telegram message:", err);
-    }
   }
 
   try {
@@ -39,7 +60,9 @@ export default async function handler(request, response) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       console.error("Missing OPENAI_API_KEY");
-      return response.status(500).json({ error: "Server missing OPENAI_API_KEY" });
+      return response
+        .status(500)
+        .json({ error: "Server missing OPENAI_API_KEY" });
     }
 
     // ---------------------------
@@ -128,15 +151,19 @@ Svar KUN med gyldig JSON på dette formatet:
     }
 
     // ---------------------------
-    // 4) FILTRERING: signal vs ikke-signal
+    // 4) FILTRERING: kun CHOCH/BOS i London-vinduet
     // ---------------------------
-    const eventType = analysis?.event || "none";
-    const isSignal = eventType && eventType !== "none";
+    const importantEvents = ["choch", "bos"];
+    const eventType = (analysis?.event || "none").toLowerCase();
 
-    if (isSignal) {
-      console.log("SMC SIGNAL:", analysis);
+    const isImportantEvent = importantEvents.includes(eventType);
+    const londonOK = isInLondonHours();
 
-      // Bygg fin tekst til Telegram
+    const shouldAlert = isImportantEvent && londonOK;
+
+    if (shouldAlert) {
+      console.log("🔔 TELEGRAM ALERT TRIGGERED. Event:", eventType);
+
       const bias = analysis.bias || "ukjent";
       const comment = analysis.comment || "";
       const entryZone = analysis.entry_zone || null;
@@ -154,8 +181,8 @@ Svar KUN med gyldig JSON på dette formatet:
       const invalidationText =
         invalidation != null ? String(invalidation) : "N/A";
 
-      const msg = [
-        "*SMC SIGNAL*",
+      const msgLines = [
+        "*SMC SIGNAL (London)*",
         "",
         `Symbol: ${data.symbol || "?"}`,
         `Event: ${eventType}`,
@@ -165,23 +192,28 @@ Svar KUN med gyldig JSON på dette formatet:
         "",
         `Entry zone: ${entryText}`,
         `Invalidation: ${invalidationText}`
-      ].join("\n");
+      ];
 
-      await sendTelegram(msg);
+      const msg = msgLines.join("\n");
+      await sendTelegramMessage(msg);
     } else {
-      console.log("SMC no signal this candle.");
+      console.log(
+        "No Telegram alert – event:",
+        eventType,
+        "| London hours:",
+        londonOK
+      );
     }
 
     // ---------------------------
-    // 5) Send svar tilbake
+    // 5) Send svar tilbake til TradingView / tester
     // ---------------------------
     return response.status(200).json({
       ok: true,
-      signal: isSignal,
+      alert: shouldAlert,
       received: data,
-      analysis: isSignal ? analysis : null
+      analysis
     });
-
   } catch (err) {
     console.error("Server error:", err);
     return response.status(500).json({ error: "Server error" });
