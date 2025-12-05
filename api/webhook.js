@@ -5,6 +5,33 @@ export default async function handler(request, response) {
     return response.status(405).json({ error: "Only POST allowed" });
   }
 
+  // --- Helper: send Telegram message ---
+  async function sendTelegram(message) {
+    const token = process.env.TELEGRAM_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+
+    if (!token || !chatId) {
+      console.error("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID");
+      return;
+    }
+
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+    try {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: "Markdown"
+        })
+      });
+    } catch (err) {
+      console.error("Error sending Telegram message:", err);
+    }
+  }
+
   try {
     const data = request.body; // JSON fra TradingView
     console.log("Received from TradingView:", data);
@@ -108,6 +135,39 @@ Svar KUN med gyldig JSON på dette formatet:
 
     if (isSignal) {
       console.log("SMC SIGNAL:", analysis);
+
+      // Bygg fin tekst til Telegram
+      const bias = analysis.bias || "ukjent";
+      const comment = analysis.comment || "";
+      const entryZone = analysis.entry_zone || null;
+      const invalidation = analysis.invalidation ?? null;
+
+      let entryText = "N/A";
+      if (
+        entryZone &&
+        entryZone.min != null &&
+        entryZone.max != null
+      ) {
+        entryText = `${entryZone.min} - ${entryZone.max}`;
+      }
+
+      const invalidationText =
+        invalidation != null ? String(invalidation) : "N/A";
+
+      const msg = [
+        "*SMC SIGNAL*",
+        "",
+        `Symbol: ${data.symbol || "?"}`,
+        `Event: ${eventType}`,
+        `Bias: ${bias}`,
+        "",
+        `Comment: ${comment}`,
+        "",
+        `Entry zone: ${entryText}`,
+        `Invalidation: ${invalidationText}`
+      ].join("\n");
+
+      await sendTelegram(msg);
     } else {
       console.log("SMC no signal this candle.");
     }
