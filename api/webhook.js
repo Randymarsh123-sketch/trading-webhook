@@ -1,20 +1,26 @@
 // api/webhook.js
 
 // ===============================
-// KONFIG: enkel in-memory storage
-// (per symbol) med siste N candles
+// KONFIG: in-memory storage
 // ===============================
-const RECENT_CANDLES_LIMIT = 600; // ca 10 timer med 1m-candles
+
+// 1m-candles per symbol (LTF)
+const RECENT_CANDLES_LIMIT = 600; // ca 10 timer med 1m
 const recentCandlesStore = {}; // { [symbol]: Candle[] }
 
-// ===============================
-// STATE-MASKIN FOR SETUP-STATUS
-// per symbol + setup
-// status: "none" | "pre" | "full"
-// resettes automatisk per dag
-// ===============================
+// HTF-lager for 15m og 1H per symbol
+// {
+//   [symbol]: {
+//      m15: [{ timestamp, open, high, low, close, volume }, ...],
+//      h1:  [{ ... }]
+//   }
+// }
+const htfStore = {};
+
+// STATE-MASKIN FOR SETUP-STATUS (per symbol + setupName)
 const setupStatusStore = {}; // { [symbol]: { [setupName]: { status, date } } }
 
+// status: "none" | "pre" | "full"
 function getTodayKey() {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
@@ -36,20 +42,18 @@ function setSetupStatus(symbol, setupName, status) {
   setupStatusStore[symbol][setupName] = { status, date: today };
 }
 
-// -------------------------------
-// HJELPER: sjekk om vi er i London-vinduet
-// London-session: ca 09:00–13:59 (CET)
-// Vi bruker serverens UTC-tid og legger til +1 time.
-// -------------------------------
+// ===============================
+// HJELPERE
+// ===============================
+
+// London-session: ca 09:00–13:59 (CET). Bruk UTC +1.
 function isInLondonHours() {
   const now = new Date();
   const hour = now.getUTCHours() + 1; // UTC + 1 ≈ CET
-  return hour >= 9 && hour < 14;      // 09:00 <= time < 14:00
+  return hour >= 9 && hour < 14;
 }
 
-// -------------------------------
-// HJELPER: send melding til Telegram
-// -------------------------------
+// Send melding til Telegram
 async function sendTelegramMessage(message) {
   const token = process.env.TELEGRAM_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -76,9 +80,7 @@ async function sendTelegramMessage(message) {
   }
 }
 
-// -------------------------------
-// HJELPER: legg candle inn i lokal buffer
-// -------------------------------
+// Legg 1m-candle i LTF-store
 function addCandleToStore(symbol, candle) {
   if (!recentCandlesStore[symbol]) {
     recentCandlesStore[symbol] = [];
@@ -89,26 +91,38 @@ function addCandleToStore(symbol, candle) {
   }
 }
 
-// -------------------------------
-// HJELPER: trekk ut HTF-POI-zoner fra innkommende data
-// støtter både:
-//
-// 1) flat:  data.poi_zones = [...]
-// 2) nested: data.htf_context.poi_zones = [...]
-// -------------------------------
-function extractPoiZones(data) {
-  if (data && Array.isArray(data.poi_zones)) {
-    return data.poi_zones;
+// Oppdater HTF-store fra payload (kind: "htf_update")
+function updateHtfStoreFromPayload(symbol, data) {
+  if (!htfStore[symbol]) {
+    htfStore[symbol] = { m15: [], h1: [] };
   }
-  if (data && data.htf_context && Array.isArray(data.htf_context.poi_zones)) {
-    return data.htf_context.poi_zones;
+
+  // Forventer struktur:
+  // {
+  //   kind: "htf_update",
+  //   symbol: "EURUSD",
+  //   htf_data: {
+  //     m15: [{ timestamp, open, high, low, close, volume }, ...],
+  //     h1:  [{ timestamp, open, high, low, close, volume }, ...]
+  //   }
+  // }
+  const htfData = data.htf_data || {};
+
+  if (Array.isArray(htfData.m15)) {
+    htfStore[symbol].m15 = htfData.m15;
   }
-  return [];
+
+  if (Array.isArray(htfData.h1)) {
+    htfStore[symbol].h1 = htfData.h1;
+  }
+
+  console.log("HTF store updated for", symbol, {
+    m15Count: htfStore[symbol].m15.length,
+    h1Count: htfStore[symbol].h1.length
+  });
 }
 
-// -------------------------------
-// HJELPER: bygg SMC-request til GPT
-// -------------------------------
+// Bygg SMC-request til GPT (bruker 1m + HTF-data)
 function buildSmcRequest(symbol, originalTick) {
   const nowIso = new Date().toISOString();
 
@@ -122,23 +136,16 @@ function buildSmcRequest(symbol, originalTick) {
   };
 
   const recentCandles = recentCandlesStore[symbol] || [];
-  const poiZones = extractPoiZones(originalTick);
+  const htfForSymbol = htfStore[symbol] || {};
+  const m15Candles = htfForSymbol.m15 || [];
+  const h1Candles = htfForSymbol.h1 || [];
 
   const htfContext = {
-    // Generisk POI-liste:
-    // [
-    //   {
-    //     timeframe: "m15" | "h1" | "h4" | "d1",
-    //     type: "demand" | "supply" | "fvg" | "last_sell_to_buy" | "last_buy_to_sell",
-    //     direction: "bullish" | "bearish" | null,
-    //     high: number,
-    //     low: number,
-    //     origin_timestamp: "ISO-string",
-    //     strength: number | null,
-    //     note: string
-    //   }
-    // ]
-    poi_zones: poiZones
+    // Rå HTF-data – du skal bruke dette til å:
+    // - finne 15m / 1H FVG / supply/demand / last-sell-to-buy
+    // - velge bias, TP, reversal-zoner
+    m15_candles: m15Candles,
+    h1_candles: h1Candles
   };
 
   const request = {
@@ -169,8 +176,8 @@ export default async function handler(request, response) {
   }
 
   try {
-    const data = request.body; // JSON fra TradingView / test / annen klient
-    console.log("Received from TradingView:", data);
+    const data = request.body; // JSON fra TradingView / tester
+    console.log("Received payload:", data);
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -180,8 +187,30 @@ export default async function handler(request, response) {
         .json({ error: "Server missing OPENAI_API_KEY" });
     }
 
-    // --- 0) Normaliser symbol + lag candle-objekt ---
     const symbol = data.symbol || "UNKNOWN";
+    const kind = data.kind || "ltf_tick"; // default: 1m-tick
+
+    // ------------------------------------
+    // 1) HTF-UPDATE (15m + 1H candles)
+    // ------------------------------------
+    if (kind === "htf_update") {
+      updateHtfStoreFromPayload(symbol, data);
+      return response.status(200).json({
+        ok: true,
+        kind: "htf_update",
+        symbol,
+        htf_counts: {
+          m15: (htfStore[symbol]?.m15?.length) || 0,
+          h1: (htfStore[symbol]?.h1?.length) || 0
+        }
+      });
+    }
+
+    // ------------------------------------
+    // 2) LTF-TICK (1m-candle) – hovedlogikk
+    // ------------------------------------
+    // Her forventer vi standard 1m payload:
+    // symbol, time_ms, open, high, low, close, volume, asia/frankfurt/london-ting osv.
 
     const now = new Date();
     const timestamp =
@@ -204,7 +233,7 @@ export default async function handler(request, response) {
 
     addCandleToStore(symbol, candle);
 
-    // --- 1) Bare analyser hvert 5. minutt ---
+    // Bare analyser hvert 5. minutt (UTC)
     const minute = now.getUTCMinutes();
     const isFiveMinuteMark = minute % 5 === 0;
 
@@ -217,72 +246,73 @@ export default async function handler(request, response) {
       );
       return response.status(200).json({
         ok: true,
+        kind: "ltf_tick",
         skipped: true,
         reason: "not_5min_mark",
         received: data
       });
     }
 
-    // --- 2) Bygg rikere SMC-request ---
+    // Bygg SMC-request (1m + HTF-data)
     const smcRequest = buildSmcRequest(symbol, data);
 
-    // --- 3) Systemprompt (moderat-aggressiv BOS + POI-zoner) ---
+    // ---------------------------
+    // Systemprompt – moderat-aggressiv BOS + HTF (15m/1H)
+    // ---------------------------
     const systemPrompt = `
 Du er en Smart Money Concepts-markedsanalytiker.
 
 Du får et JSON-objekt med:
 - symbol
-- timeframe
+- timeframe (her: "1m")
 - now_timestamp
 - session_config (asia/frankfurt/london tider)
-- recent_candles: liste med 1m candles
-- htf_context: høyere timeframe POI-zoner
-  - htf_context.poi_zones: generisk liste av viktige soner (f.eks. 15m/1H/4H/Daily supply/demand/FVG/last sell-to-buy)
+- recent_candles: liste med 1m candles (nyeste sist)
+- htf_context:
+  - m15_candles: liste med 15m OHLCV-candles (eldste → nyeste)
+  - h1_candles: liste med 1H OHLCV-candles (eldste → nyeste)
 - targets.setups_to_evaluate
-- original_tick: siste 1m candle fra TradingView (asia_high/low, frankfurt_high/low, in_london_window)
+- original_tick: siste 1m candle fra TradingView (inkl. asia_high/low, frankfurt_high/low, in_london_window)
 
-Struktur for htf_context.poi_zones:
-[
-  {
-    "timeframe": "m15" | "h1" | "h4" | "d1",
-    "type": "demand" | "supply" | "fvg" | "last_sell_to_buy" | "last_buy_to_sell",
-    "direction": "bullish" | "bearish" | null,
-    "high": number,
-    "low": number,
-    "origin_timestamp": "ISO tidspunkt for når zoben ble dannet",
-    "strength": number | null,   // 1-3 der 3 er sterkest, hvis tilgjengelig
-    "note": string               // kort tekst, f.eks. "15m demand før London impulse"
-  }
-]
+Oppgave 1 – 1m snapshot (bakoverkompabilitet):
+- Gi en kort SMC-"snapshot" NÅ:
+  - "bias": "bullish" | "bearish" | "range" | "unclear"
+  - "event": "none" | "sweep" | "frankfurt_inducement" | "london_sweep" | "choch" | "bos"
+  - "comment": kort forklaring i 1–2 setninger
+  - "entry_zone": { "min": number | null, "max": number | null }
+  - "invalidation": number | null
 
-Oppgaver:
+Ta hensyn til:
+- recent_candles på 1m (mikrostruktur: sweeps, CHOCH, BOS, FVG)
+- HTF-kontekst:
+  - m15_candles og h1_candles kan brukes til å se:
+    - 15m / 1H supply/demand-zoner
+    - bullish/bearish FVG (imbalanser)
+    - "last sell-to-buy" / "last buy-to-sell" før større impulser
+  - Hvis pris nå nærmer seg eller reagerer fra en slik HTF-sone, kommenter dette i "comment".
 
-1) Gi en enkel SMC-"snapshot" NÅ (for bakoverkompabilitet):
-   - "bias": "bullish" | "bearish" | "range" | "unclear"
-   - "event": "none" | "sweep" | "frankfurt_inducement" | "london_sweep" | "choch" | "bos"
-   - "comment": kort forklaring i 1–2 setninger
-   - "entry_zone": { "min": number | null, "max": number | null }
-   - "invalidation": number | null
+Oppgave 2 – Setup "frankfurt_london_bos_setup_1":
+- Mønster:
+  1) Frankfurt har manipulert pris én vei (typ tar ut Asia-high/low).
+  2) London sweeper likviditet på motsatt side.
+  3) En tydelig BOS etter sweepe gjør setupen fullverdig.
 
-   Ta hensyn til:
-   - recent_candles (1m struktur)
-   - viktige HTF-POI-zoner nær prisen (spesielt på m15 og h1):
-     - hvis pris går inn i en tydelig demand/supply/FVG, kommenter dette i "comment" (f.eks. "pris tester 15m demand før mulig bounce").
+- For BOS:
+  - Du kan være LITT AGGRESSIV:
+    - Hvis pris etter London-sweep lager en tydelig impuls i samme retning
+      og bryter forbi siste motstrukturs high/low (HH/HL- eller LL/LH-skifte),
+      skal du sette "bos_confirmation.found": true.
+  - Hvis Frankfurt-manipulasjon og London-sweep er bekreftet,
+    kan du gi en foreløpig entry/SL som "pre-setup" selv om BOS ikke er perfekt.
+  - Men hvis alle tre (Frankfurt + London sweep + BOS) er til stede:
+    - sett "bos_confirmation.found": true
+    - "bos_confirmation.structure_type": "bos"
+    - "is_valid": true.
 
-2) Evaluer setupen "frankfurt_london_bos_setup_1":
-   - Frankfurt har manipulert pris én vei (typ Asia-high/low tas ut i Frankfurt).
-   - London har sweept likviditet på motsatt side.
-   - Et klart BOS etter sweepe gjør setupen fullverdig.
-   - For BOS kan du være LITT AGGRESSIV: hvis pris etter London-sweep lager en tydelig impuls i samme retning som sweep og bryter forbi siste motstrukturs high/low (HH/HL- eller LL/LH-skifte), skal du sette "bos_confirmation.found": true.
-   - Hvis Frankfurt-manipulasjon og London-sweep er bekreftet, kan du likevel merke en foreløpig entry/SL som "pre-setup" selv om BOS ikke er helt perfekt, men:
-     - Hvis alle tre (Frankfurt + London sweep + BOS) er til stede, sett:
-       - "bos_confirmation.found": true
-       - "bos_confirmation.structure_type": "bos"
-       - "is_valid": true.
-
-   - Bruk relevante HTF-POI-zoner (spesielt m15/h1) til å:
-     - forklare entry (f.eks. "entry i 1m FVG inne i 15m demand")
-     - foreslå naturlige take-profit områder (f.eks. "TP ved nærmeste 1H supply/FVG over pris").
+- Bruk HTF-kontekst (m15/h1) til å:
+  - forklare entry (f.eks. "entry i 1m FVG inne i 15m demand / last-sell-to-buy")
+  - foreslå naturlige take-profit områder:
+    - f.eks. "TP ved nærmeste 1H supply/FVG over pris".
 
 Svar ALLTID med gyldig JSON i dette formatet:
 
@@ -352,7 +382,9 @@ Svar ALLTID med gyldig JSON i dette formatet:
 
     const userContent = JSON.stringify(smcRequest);
 
-    // --- 4) Kall OpenAI ---
+    // ---------------------------
+    // Kall OpenAI
+    // ---------------------------
     const payload = {
       model: "gpt-4.1-mini",
       messages: [
@@ -382,7 +414,9 @@ Svar ALLTID med gyldig JSON i dette formatet:
     const gptJson = await gptRes.json();
     const content = gptJson.choices?.[0]?.message?.content || "{}";
 
-    // --- 5) Parse ---
+    // ---------------------------
+    // Parse analysis
+    // ---------------------------
     let analysis;
     try {
       analysis = JSON.parse(content);
@@ -391,7 +425,9 @@ Svar ALLTID med gyldig JSON i dette formatet:
       analysis = { raw: content };
     }
 
-    // --- 6) Setup #1: FULL vs PRE, med state-maskin ---
+    // ---------------------------
+    // Setup #1: FULL vs PRE med state-maskin
+    // ---------------------------
     let setupAlertSent = false;
     try {
       const setups = analysis?.setups || [];
@@ -420,7 +456,7 @@ Svar ALLTID med gyldig JSON i dette formatet:
         const slPrice = setup1.stop_loss?.price ?? "N/A";
         const setupComment = setup1.comment || analysis.comment || "";
 
-        // --- FULL SETUP: BOS bekreftet ---
+        // FULL SETUP: BOS bekreftet
         if (fullCandidate && currentStatus !== "full") {
           const msgLines = [
             "*SMC SETUP #1 (FRANKFURT → LONDON → BOS)*",
@@ -450,7 +486,7 @@ Svar ALLTID med gyldig JSON i dette formatet:
           setSetupStatus(symbol, setupName, "full");
           console.log("🔔 TELEGRAM ALERT: Setup #1 FULL (med BOS). Status → full");
         }
-        // --- PRE-SETUP: Frankfurt + London funnet, ingen BOS ennå ---
+        // PRE-SETUP: Frankfurt + London funnet, ingen BOS ennå
         else if (preCandidate && currentStatus === "none") {
           const msgLines = [
             "*PRE-SETUP #1 (Frankfurt → London, venter på BOS)*",
@@ -492,7 +528,9 @@ Svar ALLTID med gyldig JSON i dette formatet:
       console.error("Error while handling Setup #1:", e);
     }
 
-    // --- 7) Fallback: enkel CHOCH/BOS i London ---
+    // ---------------------------
+    // Fallback: enkel CHOCH/BOS i London
+    // ---------------------------
     const importantEvents = ["choch", "bos"];
     const eventType = (analysis?.event || "none").toLowerCase();
     const isImportantEvent = importantEvents.includes(eventType);
@@ -545,9 +583,12 @@ Svar ALLTID med gyldig JSON i dette formatet:
 
     const finalAlertFlag = setupAlertSent || shouldAlertSimple;
 
-    // --- 8) Svar tilbake ---
+    // ---------------------------
+    // Svar tilbake
+    // ---------------------------
     return response.status(200).json({
       ok: true,
+      kind: "ltf_tick",
       alert: finalAlertFlag,
       received: data,
       smc_request: smcRequest,
