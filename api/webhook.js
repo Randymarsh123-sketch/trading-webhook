@@ -62,7 +62,6 @@ function addCandleToStore(symbol, candle) {
 
 // -------------------------------
 // HJELPER: bygg SMC-request til GPT
-// Nå bruker vi recentCandlesStore.
 // -------------------------------
 function buildSmcRequest(symbol, originalTick) {
   const nowIso = new Date().toISOString();
@@ -96,7 +95,6 @@ function buildSmcRequest(symbol, originalTick) {
         "frankfurt_london_bos_setup_1"
       ]
     },
-    // original-tick fra TradingView for ekstra info
     original_tick: originalTick
   };
 
@@ -112,7 +110,7 @@ export default async function handler(request, response) {
   }
 
   try {
-    const data = request.body; // JSON fra TradingView
+    const data = request.body; // JSON fra TradingView / test
     console.log("Received from TradingView:", data);
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -123,9 +121,7 @@ export default async function handler(request, response) {
         .json({ error: "Server missing OPENAI_API_KEY" });
     }
 
-    // ---------------------------
-    // 0) Normaliser symbol + lag candle-objekt
-    // ---------------------------
+    // --- 0) Normaliser symbol + lag candle-objekt ---
     const symbol = data.symbol || "UNKNOWN";
 
     const now = new Date();
@@ -141,19 +137,15 @@ export default async function handler(request, response) {
       low: data.low,
       close: data.close,
       volume: data.volume,
-      // Vi har foreløpig bare in_london_window som "session"-hint
       session: data.in_london_window ? "london" : "other",
-      in_asia_session: false,        // kan forbedres senere
-      in_frankfurt_session: false,   // kan forbedres senere
+      in_asia_session: false,
+      in_frankfurt_session: false,
       in_london_session: !!data.in_london_window
     };
 
-    // Legg candle i lokal buffer
     addCandleToStore(symbol, candle);
 
-    // ---------------------------
-    // 1) Bare analyser hvert 5. minutt
-    // ---------------------------
+    // --- 1) Bare analyser hvert 5. minutt ---
     const minute = now.getUTCMinutes();
     const isFiveMinuteMark = minute % 5 === 0;
 
@@ -172,14 +164,10 @@ export default async function handler(request, response) {
       });
     }
 
-    // ---------------------------
-    // 2) Bygg rikere SMC-request (Løsning A – med recent_candles)
-    // ---------------------------
+    // --- 2) Bygg rikere SMC-request ---
     const smcRequest = buildSmcRequest(symbol, data);
 
-    // ---------------------------
-    // 3) Systemprompt til modellen
-    // ---------------------------
+    // --- 3) Systemprompt ---
     const systemPrompt = `
 Du er en Smart Money Concepts-markedsanalytiker.
 
@@ -189,11 +177,9 @@ Du får et JSON-objekt med:
 - now_timestamp
 - session_config (asia/frankfurt/london tider)
 - recent_candles: liste med 1m candles
-  (timestamp, open, high, low, close, volume, session, in_*_session)
 - htf_context: høyere timeframe POI-zoner (kan være tomt)
-- targets.setups_to_evaluate: hvilke setuper du skal sjekke
-- original_tick: siste 1m candle fra TradingView med bl.a.
-  asia_high/low, frankfurt_high/low, in_london_window
+- targets.setups_to_evaluate
+- original_tick: siste 1m candle fra TradingView (asia_high/low, frankfurt_high/low, in_london_window)
 
 Oppgaver:
 
@@ -204,19 +190,13 @@ Oppgaver:
    - "entry_zone": { "min": number | null, "max": number | null }
    - "invalidation": number | null
 
-2) I tillegg skal du, hvis mulig, evaluere setupen:
-   "frankfurt_london_bos_setup_1":
+2) Evaluer setupen "frankfurt_london_bos_setup_1":
    - Frankfurt har manipulert pris én vei (typ Asia-high/low tas ut i Frankfurt).
    - London har sweept likviditet på motsatt side.
-   - Det har dannet seg en tydelig BOS etter sweepe.
-   - Setup er kun "is_valid": true når HELE sekvensen er komplett.
+   - Et klart BOS etter sweepe gjør setupen fullverdig.
+   - MEN: hvis Frankfurt-manipulasjon og London-sweep er bekreftet, kan du likevel gi en foreløpig entry/SL som "pre-setup" selv om BOS ikke er 100% etablert.
 
-Hvis setupen er gyldig, lag én entry med:
-- Entry (limit) pris rundt 1m FVG eller siste sell-to-buy / buy-to-sell-blokk
-- Take Profit basert på H1 FVG / 15m POI hvis tilgjengelig, ellers naturlig struktur-target
-- Stop Loss under/over struktur med litt buffer (f.eks. 3 pips)
-
-Du skal ALLTID svare med gyldig JSON på dette formatet (alt i samme objekt):
+Svar ALLTID med gyldig JSON i dette formatet:
 
 {
   "bias": "...",
@@ -280,19 +260,11 @@ Du skal ALLTID svare med gyldig JSON på dette formatet (alt i samme objekt):
   ],
   "raw_events": []
 }
-
-Hvis du ikke ser noen klar edge:
-- bruk "bias": "unclear" og "event": "none".
-Hvis du ikke finner et gyldig setup:
-- sett "setups": [] ELLER en entry med "is_valid": false.
-Bruk tall (number) for prisnivåer der det gir mening.
     `.trim();
 
     const userContent = JSON.stringify(smcRequest);
 
-    // ---------------------------
-    // 4) Kall OpenAI (gpt-4.1-mini)
-    // ---------------------------
+    // --- 4) Kall OpenAI ---
     const payload = {
       model: "gpt-4.1-mini",
       messages: [
@@ -322,9 +294,7 @@ Bruk tall (number) for prisnivåer der det gir mening.
     const gptJson = await gptRes.json();
     const content = gptJson.choices?.[0]?.message?.content || "{}";
 
-    // ---------------------------
-    // 5) Parse JSON-svaret
-    // ---------------------------
+    // --- 5) Parse ---
     let analysis;
     try {
       analysis = JSON.parse(content);
@@ -333,53 +303,81 @@ Bruk tall (number) for prisnivåer der det gir mening.
       analysis = { raw: content };
     }
 
-    // ---------------------------
-    // 6) Setup #1: Frankfurt → London → BOS
-    // ---------------------------
+    // --- 6) Setup #1: confirmed + pre-setup ---
     let setupAlertSent = false;
     try {
       const setups = analysis?.setups || [];
       const setup1 = setups.find(
-        (s) =>
-          s &&
-          s.name === "frankfurt_london_bos_setup_1" &&
-          s.is_valid === true
+        (s) => s && s.name === "frankfurt_london_bos_setup_1"
       );
 
       if (setup1) {
+        const legs = setup1.legs || {};
+        const frankfurt = legs.frankfurt_manipulation || {};
+        const london = legs.london_sweep || {};
+        const bos = legs.bos_confirmation || {};
+
+        const hasFrankfurt = !!frankfurt.found;
+        const hasLondon = !!london.found;
+        const hasBos = !!bos.found;
+
         const direction = (setup1.direction || "").toUpperCase();
         const entryPrice = setup1.entry?.price ?? "N/A";
         const tpPrice = setup1.take_profit?.price ?? "N/A";
         const slPrice = setup1.stop_loss?.price ?? "N/A";
-        const comment = setup1.comment || analysis.comment || "";
+        const setupComment = setup1.comment || analysis.comment || "";
 
-        const msgLines = [
-          "*SMC SETUP #1 (Frankfurt → London → BOS)*",
-          "",
-          `Symbol: ${analysis.symbol || symbol}`,
-          `Direction: ${direction || "N/A"}`,
-          "",
-          `Entry: ${entryPrice}`,
-          `Take Profit: ${tpPrice}`,
-          `Stop Loss: ${slPrice}`,
-          "",
-          "Comment:",
-          `${comment}`
-        ];
-
-        const msg = msgLines.join("\n");
-        await sendTelegramMessage(msg);
-        setupAlertSent = true;
-        console.log("🔔 TELEGRAM ALERT: Setup #1 (Frankfurt→London→BOS)");
+        // FULLVERDIG setup (med BOS)
+        if (setup1.is_valid === true || hasBos) {
+          const msgLines = [
+            "*SMC SETUP #1 (Frankfurt → London → BOS)*",
+            "",
+            `Symbol: ${analysis.symbol || symbol}`,
+            `Direction: ${direction || "N/A"}`,
+            "",
+            `Entry: ${entryPrice}`,
+            `Take Profit: ${tpPrice}`,
+            `Stop Loss: ${slPrice}`,
+            "",
+            "Comment:",
+            `${setupComment}`
+          ];
+          const msg = msgLines.join("\n");
+          await sendTelegramMessage(msg);
+          setupAlertSent = true;
+          console.log("🔔 TELEGRAM ALERT: Setup #1 (FULL – med BOS)");
+        }
+        // PRE-SETUP: Frankfurt + London funnet, men BOS mangler
+        else if (hasFrankfurt && hasLondon) {
+          const msgLines = [
+            "*PRE-SETUP #1 (Frankfurt → London, venter på BOS)*",
+            "",
+            `Symbol: ${analysis.symbol || symbol}`,
+            `Direction: ${direction || "N/A"}`,
+            "",
+            `Foreløpig entry (test): ${entryPrice}`,
+            `Foreløpig SL: ${slPrice}`,
+            "",
+            "Frankfurt:",
+            frankfurt.description || "–",
+            "",
+            "London sweep:",
+            london.description || "–",
+            "",
+            "Kommentar:",
+            setupComment || "Venter på tydelig BOS for full bekreftelse."
+          ];
+          const msg = msgLines.join("\n");
+          await sendTelegramMessage(msg);
+          setupAlertSent = true;
+          console.log("🔔 TELEGRAM ALERT: PRE-SETUP #1 (Frankfurt+London, ingen BOS ennå)");
+        }
       }
     } catch (e) {
       console.error("Error while handling Setup #1:", e);
     }
 
-    // ---------------------------
-    // 7) Fallback: enkel CHOCH/BOS i London-vinduet
-    //    (kun hvis Setup #1 ikke allerede ga alert)
-// ---------------------------
+    // --- 7) Fallback: enkel CHOCH/BOS i London ---
     const importantEvents = ["choch", "bos"];
     const eventType = (analysis?.event || "none").toLowerCase();
     const isImportantEvent = importantEvents.includes(eventType);
@@ -432,9 +430,7 @@ Bruk tall (number) for prisnivåer der det gir mening.
 
     const finalAlertFlag = setupAlertSent || shouldAlertSimple;
 
-    // ---------------------------
-    // 8) Svar tilbake (for debugging/test)
-    // ---------------------------
+    // --- 8) Svar tilbake ---
     return response.status(200).json({
       ok: true,
       alert: finalAlertFlag,
