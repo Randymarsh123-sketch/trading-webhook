@@ -46,6 +46,63 @@ async function sendTelegramMessage(message) {
 }
 
 // -------------------------------
+// HJELPER: bygg SMC-request til GPT
+// Foreløpig: kun én candle i recent_candles.
+// Senere kan du bytte til historikk fra database.
+// -------------------------------
+function buildSmcRequestFromCandle(tvPayload) {
+  const nowIso = new Date().toISOString();
+
+  const sessionConfig = {
+    asia_start: "02:00",
+    asia_end: "07:59",
+    frankfurt_start: "08:00",
+    frankfurt_end: "08:59",
+    london_start: "09:00",
+    london_end: "13:59"
+  };
+
+  const recentCandles = [
+    {
+      timestamp: nowIso, // evt. tvPayload.time_ms hvis du vil
+      open: tvPayload.open,
+      high: tvPayload.high,
+      low: tvPayload.low,
+      close: tvPayload.close,
+      volume: tvPayload.volume,
+      session: tvPayload.in_london_window ? "london" : "other",
+      in_asia_session: false,          // kan utvides senere
+      in_frankfurt_session: false,     // kan utvides senere
+      in_london_session: !!tvPayload.in_london_window
+    }
+  ];
+
+  const htfContext = {
+    m15_poi_zones: [],
+    h1_poi_zones: []
+  };
+
+  const request = {
+    symbol: tvPayload.symbol,
+    timeframe: "1m",
+    now_timestamp: nowIso,
+    timezone: "Europe/Oslo",
+    session_config: sessionConfig,
+    recent_candles: recentCandles,
+    htf_context: htfContext,
+    targets: {
+      setups_to_evaluate: [
+        "frankfurt_london_bos_setup_1"
+      ]
+    },
+    // Valgfritt: ta med original-data som ekstra kontekst
+    original_tick: tvPayload
+  };
+
+  return request;
+}
+
+// -------------------------------
 // HOVEDHANDLER
 // -------------------------------
 export default async function handler(request, response) {
@@ -66,49 +123,123 @@ export default async function handler(request, response) {
     }
 
     // ---------------------------
-    // 1) Systemprompt til modellen
+    // 1) Bygg rikere SMC-request til modellen (Løsning A - steg 1)
+    // ---------------------------
+    const smcRequest = buildSmcRequestFromCandle(data);
+
+    // ---------------------------
+    // 2) Systemprompt til modellen
     // ---------------------------
     const systemPrompt = `
 Du er en Smart Money Concepts-markedsanalytiker.
 
-Du får 1m-data i JSON fra TradingView med:
-- symbol, time_ms, open, high, low, close, volume
-- asia_high / asia_low
-- frankfurt_high / frankfurt_low
-- in_london_window (true/false)
+Du får et JSON-objekt med:
+- symbol
+- timeframe
+- now_timestamp
+- session_config (asia/frankfurt/london tider)
+- recent_candles: liste med 1m candles (timestamp, open, high, low, close, volume, session, in_*_session)
+- htf_context: høyere timeframe POI-zoner (kan være tomt)
+- targets.setups_to_evaluate: hvilke setuper du skal sjekke (f.eks. "frankfurt_london_bos_setup_1")
 
-Oppgave:
-- Vurder kort om bias akkurat NÅ er bullish, bearish, range eller uklar.
-- Sjekk om denne candle'n ser ut til å inngå i:
-  - sweep av Asia- eller Frankfurt-high/low
-  - inducement (fake move før motsatt retning)
-  - CHOCH eller BOS (strukturbrudd).
-- Vurder om markedet nå er:
-  - "klar for retrace til FVG" eller
-  - "fortsatt i likviditetsjakt" eller
-  - "ingen klar edge".
+Oppgaver:
 
-Svar KUN med gyldig JSON på dette formatet:
+1) Gi en enkel SMC-"snapshot" NÅ (for bakoverkompabilitet):
+   - "bias": "bullish" | "bearish" | "range" | "unclear"
+   - "event": "none" | "sweep" | "frankfurt_inducement" | "london_sweep" | "choch" | "bos"
+   - "comment": kort forklaring i 1–2 setninger
+   - "entry_zone": { "min": number | null, "max": number | null }
+   - "invalidation": number | null
+
+2) I tillegg skal du, hvis mulig, evaluere setupen:
+   "frankfurt_london_bos_setup_1":
+   - Frankfurt har manipulert pris én vei (typisk Asia-lows/highs tas ut i Frankfurt).
+   - London har sweept motsatt side (likviditet på den andre siden).
+   - Det har dannet seg en tydelig BOS etter sweepe.
+   - Setup skal kun være "is_valid": true når HELE sekvensen er komplett.
+
+Hvis setupen er gyldig, lag én entry med:
+- Entry (limit) pris rundt 1m FVG eller siste sell-to-buy / buy-to-sell-blokk
+- Take Profit basert på H1 FVG / 15m POI hvis tilgjengelig, ellers naturlig struktur-target
+- Stop Loss under/over struktur med litt buffer (f.eks. 3 pips)
+
+Du skal ALLTID svare med gyldig JSON på dette formatet (alt i samme objekt):
 
 {
-  "bias": "bullish" | "bearish" | "range" | "unclear",
-  "event": "none" | "sweep" | "frankfurt_inducement" | "london_sweep" | "choch" | "bos",
-  "comment": "kort forklaring på 1–2 setninger",
+  "bias": "...",
+  "event": "...",
+  "comment": "...",
   "entry_zone": { "min": null, "max": null },
-  "invalidation": null
+  "invalidation": null,
+  "symbol": "...",
+  "timeframe": "...",
+  "analysis_timestamp": "...",
+  "overall_bias": "...",
+  "setups": [
+    {
+      "name": "frankfurt_london_bos_setup_1",
+      "is_valid": false,
+      "direction": null,
+      "legs": {
+        "frankfurt_manipulation": {
+          "found": false,
+          "direction": null,
+          "start_timestamp": null,
+          "end_timestamp": null,
+          "description": ""
+        },
+        "london_sweep": {
+          "found": false,
+          "direction": null,
+          "timestamp": null,
+          "description": ""
+        },
+        "bos_confirmation": {
+          "found": false,
+          "timestamp": null,
+          "structure_type": null,
+          "description": ""
+        }
+      },
+      "entry": {
+        "type": null,
+        "price": null,
+        "zone_high": null,
+        "zone_low": null,
+        "timeframe": null,
+        "reason": ""
+      },
+      "take_profit": {
+        "price": null,
+        "reason": "",
+        "poi_references": []
+      },
+      "stop_loss": {
+        "price": null,
+        "reason": "",
+        "structure_low": null,
+        "structure_high": null,
+        "buffer_pips": null
+      },
+      "comment": "",
+      "confidence": 0
+    }
+  ],
+  "raw_events": []
 }
 
 - Hvis du IKKE ser noen klar edge, bruk:
   - "bias": "unclear"
   - "event": "none"
-- Hvis du ser mulig FVG-entry, fyll inn "entry_zone.min" og "entry_zone.max" som tall (prisnivåer).
-- Hvis du ser naturlig stop / invalidation, fyll inn "invalidation" som tall.
-`;
+- Hvis du ikke finner et gyldig setup, sett:
+  - "setups": [] ELLER en entry med "is_valid": false
+- Bruk tall (number) for prisnivåer der det gir mening.
+    `.trim();
 
-    const userContent = JSON.stringify(data);
+    const userContent = JSON.stringify(smcRequest);
 
     // ---------------------------
-    // 2) Kall OpenAI (gpt-4.1-mini)
+    // 3) Kall OpenAI (gpt-4.1-mini)
     // ---------------------------
     const payload = {
       model: "gpt-4.1-mini",
@@ -140,7 +271,7 @@ Svar KUN med gyldig JSON på dette formatet:
     const content = gptJson.choices?.[0]?.message?.content || "{}";
 
     // ---------------------------
-    // 3) Prøv å parse JSON-svaret
+    // 4) Prøv å parse JSON-svaret
     // ---------------------------
     let analysis;
     try {
@@ -151,18 +282,59 @@ Svar KUN med gyldig JSON på dette formatet:
     }
 
     // ---------------------------
-    // 4) FILTRERING: kun CHOCH/BOS i London-vinduet
+    // 5) Setup #1: Frankfurt → London → BOS
+    // ---------------------------
+    let setupAlertSent = false;
+    try {
+      const setups = analysis?.setups || [];
+      const setup1 = setups.find(
+        (s) =>
+          s &&
+          s.name === "frankfurt_london_bos_setup_1" &&
+          s.is_valid === true
+      );
+
+      if (setup1) {
+        const direction = (setup1.direction || "").toUpperCase();
+        const entryPrice = setup1.entry?.price ?? "N/A";
+        const tpPrice = setup1.take_profit?.price ?? "N/A";
+        const slPrice = setup1.stop_loss?.price ?? "N/A";
+        const comment = setup1.comment || analysis.comment || "";
+
+        const msgLines = [
+          "*SMC SETUP #1 (Frankfurt → London → BOS)*",
+          "",
+          `Symbol: ${analysis.symbol || data.symbol || "?"}`,
+          `Direction: ${direction || "N/A"}`,
+          "",
+          `Entry: ${entryPrice}`,
+          `Take Profit: ${tpPrice}`,
+          `Stop Loss: ${slPrice}`,
+          "",
+          `Comment:`,
+          `${comment}`
+        ];
+
+        const msg = msgLines.join("\n");
+        await sendTelegramMessage(msg);
+        setupAlertSent = true;
+        console.log("🔔 TELEGRAM ALERT: Setup #1 (Frankfurt→London→BOS)");
+      }
+    } catch (e) {
+      console.error("Error while handling Setup #1:", e);
+    }
+
+    // ---------------------------
+    // 6) FILTRERING: fallback til enkel CHOCH/BOS i London-vinduet
     // ---------------------------
     const importantEvents = ["choch", "bos"];
     const eventType = (analysis?.event || "none").toLowerCase();
-
     const isImportantEvent = importantEvents.includes(eventType);
     const londonOK = isInLondonHours();
+    const shouldAlertSimple = isImportantEvent && londonOK && !setupAlertSent;
 
-    const shouldAlert = isImportantEvent && londonOK;
-
-    if (shouldAlert) {
-      console.log("🔔 TELEGRAM ALERT TRIGGERED. Event:", eventType);
+    if (shouldAlertSimple) {
+      console.log("🔔 TELEGRAM ALERT (simple CHOCH/BOS). Event:", eventType);
 
       const bias = analysis.bias || "ukjent";
       const comment = analysis.comment || "";
@@ -196,7 +368,7 @@ Svar KUN med gyldig JSON på dette formatet:
 
       const msg = msgLines.join("\n");
       await sendTelegramMessage(msg);
-    } else {
+    } else if (!setupAlertSent) {
       console.log(
         "No Telegram alert – event:",
         eventType,
@@ -205,13 +377,16 @@ Svar KUN med gyldig JSON på dette formatet:
       );
     }
 
+    const finalAlertFlag = setupAlertSent || shouldAlertSimple;
+
     // ---------------------------
-    // 5) Send svar tilbake til TradingView / tester
+    // 7) Send svar tilbake til TradingView / tester
     // ---------------------------
     return response.status(200).json({
       ok: true,
-      alert: shouldAlert,
+      alert: finalAlertFlag,
       received: data,
+      smc_request: smcRequest,
       analysis
     });
   } catch (err) {
