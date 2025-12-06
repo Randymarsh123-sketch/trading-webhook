@@ -7,6 +7,35 @@
 const RECENT_CANDLES_LIMIT = 600; // ca 10 timer med 1m-candles
 const recentCandlesStore = {}; // { [symbol]: Candle[] }
 
+// ===============================
+// STATE-MASKIN FOR SETUP-STATUS
+// per symbol + setup
+// status: "none" | "pre" | "full"
+// resettes automatisk per dag
+// ===============================
+const setupStatusStore = {}; // { [symbol]: { [setupName]: { status, date } } }
+
+function getTodayKey() {
+  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+}
+
+function getSetupStatus(symbol, setupName) {
+  const today = getTodayKey();
+  const symbolState = setupStatusStore[symbol];
+  if (!symbolState) return "none";
+  const setupState = symbolState[setupName];
+  if (!setupState || setupState.date !== today) return "none";
+  return setupState.status || "none";
+}
+
+function setSetupStatus(symbol, setupName, status) {
+  const today = getTodayKey();
+  if (!setupStatusStore[symbol]) {
+    setupStatusStore[symbol] = {};
+  }
+  setupStatusStore[symbol][setupName] = { status, date: today };
+}
+
 // -------------------------------
 // HJELPER: sjekk om vi er i London-vinduet
 // London-session: ca 09:00–13:59 (CET)
@@ -167,7 +196,7 @@ export default async function handler(request, response) {
     // --- 2) Bygg rikere SMC-request ---
     const smcRequest = buildSmcRequest(symbol, data);
 
-    // --- 3) Systemprompt ---
+    // --- 3) Systemprompt (mer aggressiv BOS) ---
     const systemPrompt = `
 Du er en Smart Money Concepts-markedsanalytiker.
 
@@ -194,7 +223,12 @@ Oppgaver:
    - Frankfurt har manipulert pris én vei (typ Asia-high/low tas ut i Frankfurt).
    - London har sweept likviditet på motsatt side.
    - Et klart BOS etter sweepe gjør setupen fullverdig.
-   - MEN: hvis Frankfurt-manipulasjon og London-sweep er bekreftet, kan du likevel gi en foreløpig entry/SL som "pre-setup" selv om BOS ikke er 100% etablert.
+   - For BOS kan du være LITT AGGRESSIV: hvis pris etter London-sweep lager en tydelig impuls i samme retning som sweep og bryter forbi siste motstrukturs high/low (HH/HL eller LL/LH-skifte), skal du sette "bos_confirmation.found": true.
+   - Hvis Frankfurt-manipulasjon og London-sweep er bekreftet, kan du likevel merke en foreløpig entry/SL som "pre-setup" selv om BOS ikke er helt perfekt, men:
+     - Hvis alle tre (Frankfurt + London sweep + BOS) er til stede, sett:
+       - "bos_confirmation.found": true
+       - "bos_confirmation.structure_type": "bos"
+       - "is_valid": true.
 
 Svar ALLTID med gyldig JSON i dette formatet:
 
@@ -303,12 +337,13 @@ Svar ALLTID med gyldig JSON i dette formatet:
       analysis = { raw: content };
     }
 
-    // --- 6) Setup #1: confirmed + pre-setup ---
+    // --- 6) Setup #1: FULL vs PRE, med state-maskin ---
     let setupAlertSent = false;
     try {
       const setups = analysis?.setups || [];
+      const setupName = "frankfurt_london_bos_setup_1";
       const setup1 = setups.find(
-        (s) => s && s.name === "frankfurt_london_bos_setup_1"
+        (s) => s && s.name === setupName
       );
 
       if (setup1) {
@@ -320,6 +355,10 @@ Svar ALLTID med gyldig JSON i dette formatet:
         const hasFrankfurt = !!frankfurt.found;
         const hasLondon = !!london.found;
         const hasBos = !!bos.found;
+        const currentStatus = getSetupStatus(symbol, setupName);
+
+        const preCandidate = hasFrankfurt && hasLondon && !hasBos;
+        const fullCandidate = hasFrankfurt && hasLondon && hasBos;
 
         const direction = (setup1.direction || "").toUpperCase();
         const entryPrice = setup1.entry?.price ?? "N/A";
@@ -327,10 +366,10 @@ Svar ALLTID med gyldig JSON i dette formatet:
         const slPrice = setup1.stop_loss?.price ?? "N/A";
         const setupComment = setup1.comment || analysis.comment || "";
 
-        // FULLVERDIG setup (med BOS)
-        if (setup1.is_valid === true || hasBos) {
+        // --- FULL SETUP: BOS bekreftet ---
+        if (fullCandidate && currentStatus !== "full") {
           const msgLines = [
-            "*SMC SETUP #1 (Frankfurt → London → BOS)*",
+            "*SMC SETUP #1 (FRANKFURT → LONDON → BOS)*",
             "",
             `Symbol: ${analysis.symbol || symbol}`,
             `Direction: ${direction || "N/A"}`,
@@ -339,16 +378,26 @@ Svar ALLTID med gyldig JSON i dette formatet:
             `Take Profit: ${tpPrice}`,
             `Stop Loss: ${slPrice}`,
             "",
-            "Comment:",
-            `${setupComment}`
+            "Frankfurt:",
+            frankfurt.description || "–",
+            "",
+            "London sweep:",
+            london.description || "–",
+            "",
+            "BOS:",
+            bos.description || "–",
+            "",
+            "Kommentar:",
+            setupComment
           ];
           const msg = msgLines.join("\n");
           await sendTelegramMessage(msg);
           setupAlertSent = true;
-          console.log("🔔 TELEGRAM ALERT: Setup #1 (FULL – med BOS)");
+          setSetupStatus(symbol, setupName, "full");
+          console.log("🔔 TELEGRAM ALERT: Setup #1 FULL (med BOS). Status → full");
         }
-        // PRE-SETUP: Frankfurt + London funnet, men BOS mangler
-        else if (hasFrankfurt && hasLondon) {
+        // --- PRE-SETUP: Frankfurt + London funnet, ingen BOS ennå ---
+        else if (preCandidate && currentStatus === "none") {
           const msgLines = [
             "*PRE-SETUP #1 (Frankfurt → London, venter på BOS)*",
             "",
@@ -370,7 +419,19 @@ Svar ALLTID med gyldig JSON i dette formatet:
           const msg = msgLines.join("\n");
           await sendTelegramMessage(msg);
           setupAlertSent = true;
-          console.log("🔔 TELEGRAM ALERT: PRE-SETUP #1 (Frankfurt+London, ingen BOS ennå)");
+          setSetupStatus(symbol, setupName, "pre");
+          console.log("🔔 TELEGRAM ALERT: PRE-SETUP #1. Status none → pre");
+        } else {
+          console.log(
+            "Setup #1 evaluated. hasFrankfurt:",
+            hasFrankfurt,
+            "hasLondon:",
+            hasLondon,
+            "hasBos:",
+            hasBos,
+            "currentStatus:",
+            currentStatus
+          );
         }
       }
     } catch (e) {
