@@ -8,15 +8,6 @@
 const RECENT_CANDLES_LIMIT = 600; // ca 10 timer med 1m
 const recentCandlesStore = {}; // { [symbol]: Candle[] }
 
-// HTF-lager for 15m og 1H per symbol
-// {
-//   [symbol]: {
-//      m15: [{ timestamp, open, high, low, close, volume }, ...],
-//      h1:  [{ ... }]
-//   }
-// }
-const htfStore = {};
-
 // STATE-MASKIN FOR SETUP-STATUS (per symbol + setupName)
 const setupStatusStore = {}; // { [symbol]: { [setupName]: { status, date } } }
 
@@ -91,39 +82,8 @@ function addCandleToStore(symbol, candle) {
   }
 }
 
-// Oppdater HTF-store fra payload (kind: "htf_update")
-function updateHtfStoreFromPayload(symbol, data) {
-  if (!htfStore[symbol]) {
-    htfStore[symbol] = { m15: [], h1: [] };
-  }
-
-  // Forventer struktur:
-  // {
-  //   kind: "htf_update",
-  //   symbol: "EURUSD",
-  //   htf_data: {
-  //     m15: [{ timestamp, open, high, low, close, volume }, ...],
-  //     h1:  [{ timestamp, open, high, low, close, volume }, ...]
-  //   }
-  // }
-  const htfData = data.htf_data || {};
-
-  if (Array.isArray(htfData.m15)) {
-    htfStore[symbol].m15 = htfData.m15;
-  }
-
-  if (Array.isArray(htfData.h1)) {
-    htfStore[symbol].h1 = htfData.h1;
-  }
-
-  console.log("HTF store updated for", symbol, {
-    m15Count: htfStore[symbol].m15.length,
-    h1Count: htfStore[symbol].h1.length
-  });
-}
-
-// Bygg SMC-request til GPT (bruker 1m + HTF-data)
-function buildSmcRequest(symbol, originalTick) {
+// Bygg SMC-request til GPT (bruker 1m + HTF-data fra payload)
+function buildSmcRequest(symbol, originalTick, htfData) {
   const nowIso = new Date().toISOString();
 
   const sessionConfig = {
@@ -136,12 +96,12 @@ function buildSmcRequest(symbol, originalTick) {
   };
 
   const recentCandles = recentCandlesStore[symbol] || [];
-  const htfForSymbol = htfStore[symbol] || {};
-  const m15Candles = htfForSymbol.m15 || [];
-  const h1Candles = htfForSymbol.h1 || [];
+
+  const m15Candles = Array.isArray(htfData?.m15) ? htfData.m15 : [];
+  const h1Candles = Array.isArray(htfData?.h1) ? htfData.h1 : [];
 
   const htfContext = {
-    // Rå HTF-data – du skal bruke dette til å:
+    // Rå HTF-data – modellen bruker dette til å:
     // - finne 15m / 1H FVG / supply/demand / last-sell-to-buy
     // - velge bias, TP, reversal-zoner
     m15_candles: m15Candles,
@@ -157,9 +117,7 @@ function buildSmcRequest(symbol, originalTick) {
     recent_candles: recentCandles,
     htf_context: htfContext,
     targets: {
-      setups_to_evaluate: [
-        "frankfurt_london_bos_setup_1"
-      ]
+      setups_to_evaluate: ["frankfurt_london_bos_setup_1"]
     },
     original_tick: originalTick
   };
@@ -188,30 +146,10 @@ export default async function handler(request, response) {
     }
 
     const symbol = data.symbol || "UNKNOWN";
-    const kind = data.kind || "ltf_tick"; // default: 1m-tick
 
-    // ------------------------------------
-    // 1) HTF-UPDATE (15m + 1H candles)
-    // ------------------------------------
-    if (kind === "htf_update") {
-      updateHtfStoreFromPayload(symbol, data);
-      return response.status(200).json({
-        ok: true,
-        kind: "htf_update",
-        symbol,
-        htf_counts: {
-          m15: (htfStore[symbol]?.m15?.length) || 0,
-          h1: (htfStore[symbol]?.h1?.length) || 0
-        }
-      });
-    }
-
-    // ------------------------------------
-    // 2) LTF-TICK (1m-candle) – hovedlogikk
-    // ------------------------------------
-    // Her forventer vi standard 1m payload:
-    // symbol, time_ms, open, high, low, close, volume, asia/frankfurt/london-ting osv.
-
+    // -------------------------------
+    // Bygg candle til LTF-store
+    // -------------------------------
     const now = new Date();
     const timestamp =
       data.time_ms != null
@@ -233,7 +171,9 @@ export default async function handler(request, response) {
 
     addCandleToStore(symbol, candle);
 
-    // Bare analyser hvert 5. minutt (UTC)
+    // -------------------------------
+    // Throttling: kun hvert 5. minutt
+    // -------------------------------
     const minute = now.getUTCMinutes();
     const isFiveMinuteMark = minute % 5 === 0;
 
@@ -253,11 +193,14 @@ export default async function handler(request, response) {
       });
     }
 
-    // Bygg SMC-request (1m + HTF-data)
-    const smcRequest = buildSmcRequest(symbol, data);
+    // -------------------------------
+    // Bygg SMC-request (1m + HTF fra payload)
+    // -------------------------------
+    const htfData = data.htf_data || {};
+    const smcRequest = buildSmcRequest(symbol, data, htfData);
 
     // ---------------------------
-    // Systemprompt – moderat-aggressiv BOS + HTF (15m/1H)
+    // Systemprompt – 1m + HTF (15m/1H)
     // ---------------------------
     const systemPrompt = `
 Du er en Smart Money Concepts-markedsanalytiker.
@@ -272,7 +215,7 @@ Du får et JSON-objekt med:
   - m15_candles: liste med 15m OHLCV-candles (eldste → nyeste)
   - h1_candles: liste med 1H OHLCV-candles (eldste → nyeste)
 - targets.setups_to_evaluate
-- original_tick: siste 1m candle fra TradingView (inkl. asia_high/low, frankfurt_high/low, in_london_window)
+- original_tick: siste 1m candle fra TradingView (inkl. asia_high/low, frankfurt_high/low, in_london_window, osv.)
 
 Oppgave 1 – 1m snapshot (bakoverkompabilitet):
 - Gi en kort SMC-"snapshot" NÅ:
