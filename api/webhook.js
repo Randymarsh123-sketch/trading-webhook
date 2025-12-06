@@ -90,6 +90,23 @@ function addCandleToStore(symbol, candle) {
 }
 
 // -------------------------------
+// HJELPER: trekk ut HTF-POI-zoner fra innkommende data
+// støtter både:
+//
+// 1) flat:  data.poi_zones = [...]
+// 2) nested: data.htf_context.poi_zones = [...]
+// -------------------------------
+function extractPoiZones(data) {
+  if (data && Array.isArray(data.poi_zones)) {
+    return data.poi_zones;
+  }
+  if (data && data.htf_context && Array.isArray(data.htf_context.poi_zones)) {
+    return data.htf_context.poi_zones;
+  }
+  return [];
+}
+
+// -------------------------------
 // HJELPER: bygg SMC-request til GPT
 // -------------------------------
 function buildSmcRequest(symbol, originalTick) {
@@ -105,10 +122,23 @@ function buildSmcRequest(symbol, originalTick) {
   };
 
   const recentCandles = recentCandlesStore[symbol] || [];
+  const poiZones = extractPoiZones(originalTick);
 
   const htfContext = {
-    m15_poi_zones: [],
-    h1_poi_zones: []
+    // Generisk POI-liste:
+    // [
+    //   {
+    //     timeframe: "m15" | "h1" | "h4" | "d1",
+    //     type: "demand" | "supply" | "fvg" | "last_sell_to_buy" | "last_buy_to_sell",
+    //     direction: "bullish" | "bearish" | null,
+    //     high: number,
+    //     low: number,
+    //     origin_timestamp: "ISO-string",
+    //     strength: number | null,
+    //     note: string
+    //   }
+    // ]
+    poi_zones: poiZones
   };
 
   const request = {
@@ -139,7 +169,7 @@ export default async function handler(request, response) {
   }
 
   try {
-    const data = request.body; // JSON fra TradingView / test
+    const data = request.body; // JSON fra TradingView / test / annen klient
     console.log("Received from TradingView:", data);
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -196,7 +226,7 @@ export default async function handler(request, response) {
     // --- 2) Bygg rikere SMC-request ---
     const smcRequest = buildSmcRequest(symbol, data);
 
-    // --- 3) Systemprompt (mer aggressiv BOS) ---
+    // --- 3) Systemprompt (moderat-aggressiv BOS + POI-zoner) ---
     const systemPrompt = `
 Du er en Smart Money Concepts-markedsanalytiker.
 
@@ -206,9 +236,24 @@ Du får et JSON-objekt med:
 - now_timestamp
 - session_config (asia/frankfurt/london tider)
 - recent_candles: liste med 1m candles
-- htf_context: høyere timeframe POI-zoner (kan være tomt)
+- htf_context: høyere timeframe POI-zoner
+  - htf_context.poi_zones: generisk liste av viktige soner (f.eks. 15m/1H/4H/Daily supply/demand/FVG/last sell-to-buy)
 - targets.setups_to_evaluate
 - original_tick: siste 1m candle fra TradingView (asia_high/low, frankfurt_high/low, in_london_window)
+
+Struktur for htf_context.poi_zones:
+[
+  {
+    "timeframe": "m15" | "h1" | "h4" | "d1",
+    "type": "demand" | "supply" | "fvg" | "last_sell_to_buy" | "last_buy_to_sell",
+    "direction": "bullish" | "bearish" | null,
+    "high": number,
+    "low": number,
+    "origin_timestamp": "ISO tidspunkt for når zoben ble dannet",
+    "strength": number | null,   // 1-3 der 3 er sterkest, hvis tilgjengelig
+    "note": string               // kort tekst, f.eks. "15m demand før London impulse"
+  }
+]
 
 Oppgaver:
 
@@ -219,16 +264,25 @@ Oppgaver:
    - "entry_zone": { "min": number | null, "max": number | null }
    - "invalidation": number | null
 
+   Ta hensyn til:
+   - recent_candles (1m struktur)
+   - viktige HTF-POI-zoner nær prisen (spesielt på m15 og h1):
+     - hvis pris går inn i en tydelig demand/supply/FVG, kommenter dette i "comment" (f.eks. "pris tester 15m demand før mulig bounce").
+
 2) Evaluer setupen "frankfurt_london_bos_setup_1":
    - Frankfurt har manipulert pris én vei (typ Asia-high/low tas ut i Frankfurt).
    - London har sweept likviditet på motsatt side.
    - Et klart BOS etter sweepe gjør setupen fullverdig.
-   - For BOS kan du være LITT AGGRESSIV: hvis pris etter London-sweep lager en tydelig impuls i samme retning som sweep og bryter forbi siste motstrukturs high/low (HH/HL eller LL/LH-skifte), skal du sette "bos_confirmation.found": true.
+   - For BOS kan du være LITT AGGRESSIV: hvis pris etter London-sweep lager en tydelig impuls i samme retning som sweep og bryter forbi siste motstrukturs high/low (HH/HL- eller LL/LH-skifte), skal du sette "bos_confirmation.found": true.
    - Hvis Frankfurt-manipulasjon og London-sweep er bekreftet, kan du likevel merke en foreløpig entry/SL som "pre-setup" selv om BOS ikke er helt perfekt, men:
      - Hvis alle tre (Frankfurt + London sweep + BOS) er til stede, sett:
        - "bos_confirmation.found": true
        - "bos_confirmation.structure_type": "bos"
        - "is_valid": true.
+
+   - Bruk relevante HTF-POI-zoner (spesielt m15/h1) til å:
+     - forklare entry (f.eks. "entry i 1m FVG inne i 15m demand")
+     - foreslå naturlige take-profit områder (f.eks. "TP ved nærmeste 1H supply/FVG over pris").
 
 Svar ALLTID med gyldig JSON i dette formatet:
 
