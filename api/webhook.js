@@ -1,50 +1,8 @@
 // api/webhook.js
 
-// ===============================
-// KONFIG: in-memory storage
-// ===============================
-
-// 1m-candles per symbol (LTF)
-const RECENT_CANDLES_LIMIT = 600; // ca 10 timer med 1m
-const recentCandlesStore = {}; // { [symbol]: Candle[] }
-
-// STATE-MASKIN FOR SETUP-STATUS (per symbol + setupName)
-const setupStatusStore = {}; // { [symbol]: { [setupName]: { status, date } } }
-
-// status: "none" | "pre" | "full"
-function getTodayKey() {
-  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
-}
-
-function getSetupStatus(symbol, setupName) {
-  const today = getTodayKey();
-  const symbolState = setupStatusStore[symbol];
-  if (!symbolState) return "none";
-  const setupState = symbolState[setupName];
-  if (!setupState || setupState.date !== today) return "none";
-  return setupState.status || "none";
-}
-
-function setSetupStatus(symbol, setupName, status) {
-  const today = getTodayKey();
-  if (!setupStatusStore[symbol]) {
-    setupStatusStore[symbol] = {};
-  }
-  setupStatusStore[symbol][setupName] = { status, date: today };
-}
-
-// ===============================
-// HJELPERE
-// ===============================
-
-// London-session: ca 09:00–13:59 (CET). Bruk UTC +1.
-function isInLondonHours() {
-  const now = new Date();
-  const hour = now.getUTCHours() + 1; // UTC + 1 ≈ CET
-  return hour >= 9 && hour < 14;
-}
-
-// Send melding til Telegram
+// -------------------------------
+// HJELPER: send melding til Telegram
+// -------------------------------
 async function sendTelegramMessage(message) {
   const token = process.env.TELEGRAM_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -71,71 +29,29 @@ async function sendTelegramMessage(message) {
   }
 }
 
-// Legg 1m-candle i LTF-store
-function addCandleToStore(symbol, candle) {
-  if (!recentCandlesStore[symbol]) {
-    recentCandlesStore[symbol] = [];
-  }
-  recentCandlesStore[symbol].push(candle);
-  if (recentCandlesStore[symbol].length > RECENT_CANDLES_LIMIT) {
-    recentCandlesStore[symbol].shift();
-  }
+// -------------------------------
+// HJELPER: finn CET-time (UTC+1) fra time_ms
+// TradingView time_ms er i UTC, vi legger til +1 time
+// -------------------------------
+function getCetHourMinute(timeMs) {
+  const dt = new Date(timeMs);
+  const utcHour = dt.getUTCHours();
+  const cetHour = (utcHour + 1 + 24) % 24; // CET = UTC+1
+  const minute = dt.getUTCMinutes();
+  return { cetHour, minute };
 }
 
-// Bygg SMC-request til GPT (bruker 1m + HTF-data fra payload)
-function buildSmcRequest(symbol, originalTick, htfData) {
-  const nowIso = new Date().toISOString();
-
-  const sessionConfig = {
-    asia_start: "02:00",
-    asia_end: "07:59",
-    frankfurt_start: "08:00",
-    frankfurt_end: "08:59",
-    london_start: "09:00",
-    london_end: "13:59"
-  };
-
-  const recentCandles = recentCandlesStore[symbol] || [];
-
-  const m15Candles = Array.isArray(htfData?.m15) ? htfData.m15 : [];
-  const h1Candles = Array.isArray(htfData?.h1) ? htfData.h1 : [];
-
-  const htfContext = {
-    // Rå HTF-data – modellen bruker dette til å:
-    // - finne 15m / 1H FVG / supply/demand / last-sell-to-buy
-    // - velge bias, TP, reversal-zoner
-    m15_candles: m15Candles,
-    h1_candles: h1Candles
-  };
-
-  const request = {
-    symbol,
-    timeframe: "1m",
-    now_timestamp: nowIso,
-    timezone: "Europe/Oslo",
-    session_config: sessionConfig,
-    recent_candles: recentCandles,
-    htf_context: htfContext,
-    targets: {
-      setups_to_evaluate: ["frankfurt_london_bos_setup_1"]
-    },
-    original_tick: originalTick
-  };
-
-  return request;
-}
-
-// ===============================
+// -------------------------------
 // HOVEDHANDLER
-// ===============================
+// -------------------------------
 export default async function handler(request, response) {
   if (request.method !== "POST") {
     return response.status(405).json({ error: "Only POST allowed" });
   }
 
   try {
-    const data = request.body; // JSON fra TradingView / tester
-    console.log("Received payload:", data);
+    const data = request.body; // JSON fra TradingView
+    console.log("Received from TradingView:", data);
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -145,196 +61,137 @@ export default async function handler(request, response) {
         .json({ error: "Server missing OPENAI_API_KEY" });
     }
 
-    const symbol = data.symbol || "UNKNOWN";
+    const timeMs = data.time_ms;
+    if (!timeMs) {
+      console.error("Missing time_ms in payload");
+      return response
+        .status(400)
+        .json({ error: "Missing time_ms in payload", received: data });
+    }
 
-    // -------------------------------
-    // Bygg candle til LTF-store
-    // -------------------------------
-    const now = new Date();
-    const timestamp =
-      data.time_ms != null
-        ? new Date(data.time_ms).toISOString()
-        : now.toISOString();
+    // Finn CET-time basert på UTC +1
+    const { cetHour, minute } = getCetHourMinute(timeMs);
 
-    const candle = {
-      timestamp,
-      open: data.open,
-      high: data.high,
-      low: data.low,
-      close: data.close,
-      volume: data.volume,
-      session: data.in_london_window ? "london" : "other",
-      in_asia_session: false,
-      in_frankfurt_session: false,
-      in_london_session: !!data.in_london_window
-    };
+    // Sjekk om dette er 09:00 eller 09:30 CET
+    let reportKind = null;
+    if (cetHour === 9 && minute === 0) {
+      reportKind = "0900";
+    } else if (cetHour === 9 && minute === 30) {
+      reportKind = "0930";
+    }
 
-    addCandleToStore(symbol, candle);
-
-    // -------------------------------
-    // Throttling: kun hvert 5. minutt
-    // -------------------------------
-    const minute = now.getUTCMinutes();
-    const isFiveMinuteMark = minute % 5 === 0;
-
-    if (!isFiveMinuteMark) {
-      console.log(
-        "Skipping GPT call (not 5-min mark). Minute:",
-        minute,
-        "Symbol:",
-        symbol
-      );
+    if (!reportKind) {
+      // Ikke noe vi skal lage rapport på akkurat nå
       return response.status(200).json({
         ok: true,
-        kind: "ltf_tick",
         skipped: true,
-        reason: "not_5min_mark",
+        reason: "no_report_due",
+        cetHour,
+        minute,
         received: data
       });
     }
 
-    // -------------------------------
-    // Bygg SMC-request (1m + HTF fra payload)
-    // -------------------------------
-    const htfData = data.htf_data || {};
-    const smcRequest = buildSmcRequest(symbol, data, htfData);
+    // Bygg et "SMC request"-objekt som sendes til modellen
+    const nowIso = new Date(timeMs).toISOString();
+
+    const smcRequest = {
+      symbol: data.symbol || null,
+      timeframe_base: data.timeframe || "5m",
+      now_timestamp: nowIso,
+      time_ms: data.time_ms,
+      asia_high: data.asia_high ?? null,
+      asia_low: data.asia_low ?? null,
+      frankfurt_high: data.frankfurt_high ?? null,
+      frankfurt_low: data.frankfurt_low ?? null,
+      in_london_window: data.in_london_window ?? false,
+      last_candle: {
+        open: data.open,
+        high: data.high,
+        low: data.low,
+        close: data.close,
+        volume: data.volume
+      },
+      htf_data: data.htf_data || {}
+    };
 
     // ---------------------------
-    // Systemprompt – 1m + HTF (15m/1H)
+    // Velg systemprompt avhengig av rapport-type
     // ---------------------------
-    const systemPrompt = `
-Du er en Smart Money Concepts-markedsanalytiker.
+    let systemPrompt = "";
+    if (reportKind === "0900") {
+      systemPrompt = `
+Du er en Smart Money Concepts-analytiker for FX (EURUSD).
 
-Du får et JSON-objekt med:
-- symbol
-- timeframe (her: "1m")
-- now_timestamp
-- session_config (asia/frankfurt/london tider)
-- recent_candles: liste med 1m candles (nyeste sist)
-- htf_context:
-  - m15_candles: liste med 15m OHLCV-candles (eldste → nyeste)
-  - h1_candles: liste med 1H OHLCV-candles (eldste → nyeste)
-- targets.setups_to_evaluate
-- original_tick: siste 1m candle fra TradingView (inkl. asia_high/low, frankfurt_high/low, in_london_window, osv.)
+Du får JSON-data med:
+- 5m siste candle
+- Asia-high/low, Frankfurt-high/low
+- 15m- og 1H-historikk (htf_data.m15 og htf_data.h1)
 
-Oppgave 1 – 1m snapshot (bakoverkompabilitet):
-- Gi en kort SMC-"snapshot" NÅ:
-  - "bias": "bullish" | "bearish" | "range" | "unclear"
-  - "event": "none" | "sweep" | "frankfurt_inducement" | "london_sweep" | "choch" | "bos"
-  - "comment": kort forklaring i 1–2 setninger
-  - "entry_zone": { "min": number | null, "max": number | null }
-  - "invalidation": number | null
+Oppgave:
+Lag en KORT morgenrapport for London-session rett før London åpner (09:00 CET).
 
-Ta hensyn til:
-- recent_candles på 1m (mikrostruktur: sweeps, CHOCH, BOS, FVG)
-- HTF-kontekst:
-  - m15_candles og h1_candles kan brukes til å se:
-    - 15m / 1H supply/demand-zoner
-    - bullish/bearish FVG (imbalanser)
-    - "last sell-to-buy" / "last buy-to-sell" før større impulser
-  - Hvis pris nå nærmer seg eller reagerer fra en slik HTF-sone, kommenter dette i "comment".
+Du skal:
+1) Gi kort London-bias frem til ca. 14:00 basert på Asia + Frankfurt + HTF-struktur.
+2) Gi kort "daily bias" (hvordan London + NY kan spille ut i løpet av dagen).
+3) Beskriv 2 mest sannsynlige scenarioer for London mellom 09:00 og 10:00:
+   - Scenario A
+   - Scenario B
+   For hvert scenario: forklar kort hva som MÅ skje strukturelt (SMC) for at scenariet blir aktuelt
+   (f.eks. sweep av Asia-high, BOS over X, manipulasjon i motsatt retning, osv.)
 
-Oppgave 2 – Setup "frankfurt_london_bos_setup_1":
-- Mønster:
-  1) Frankfurt har manipulert pris én vei (typ tar ut Asia-high/low).
-  2) London sweeper likviditet på motsatt side.
-  3) En tydelig BOS etter sweepe gjør setupen fullverdig.
+Skriv:
+- maks 2 korte avsnitt
+- pluss 2 korte bullets (Scenario A og Scenario B).
+Bruk enkelt språk (trenger ikke tung teori), men du kan bruke ord som "sweep", "BOS", "manipulasjon" osv.
+Ikke skriv i punktliste for alt, bare for scenarioene til slutt.
+      `;
+    } else if (reportKind === "0930") {
+      systemPrompt = `
+Du er en Smart Money Concepts-analytiker for FX (EURUSD).
 
-- For BOS:
-  - Du kan være LITT AGGRESSIV:
-    - Hvis pris etter London-sweep lager en tydelig impuls i samme retning
-      og bryter forbi siste motstrukturs high/low (HH/HL- eller LL/LH-skifte),
-      skal du sette "bos_confirmation.found": true.
-  - Hvis Frankfurt-manipulasjon og London-sweep er bekreftet,
-    kan du gi en foreløpig entry/SL som "pre-setup" selv om BOS ikke er perfekt.
-  - Men hvis alle tre (Frankfurt + London sweep + BOS) er til stede:
-    - sett "bos_confirmation.found": true
-    - "bos_confirmation.structure_type": "bos"
-    - "is_valid": true.
+Du får JSON-data med:
+- 5m siste candle (nå rundt 09:30 CET)
+- Asia-high/low, Frankfurt-high/low
+- 15m- og 1H-historikk (htf_data.m15 og htf_data.h1)
 
-- Bruk HTF-kontekst (m15/h1) til å:
-  - forklare entry (f.eks. "entry i 1m FVG inne i 15m demand / last-sell-to-buy")
-  - foreslå naturlige take-profit områder:
-    - f.eks. "TP ved nærmeste 1H supply/FVG over pris".
+Oppgave:
+Lag en kort London-oppdatering for 09:30 CET.
 
-Svar ALLTID med gyldig JSON i dette formatet:
+Du skal:
+1) Si om det har skjedd:
+   - manipulasjon i Frankfurt (i forhold til Asia-range)
+   - sweep i London (over/under Asia/Frankfurt-nivåer)
+   - CHOCH eller BOS på 5m frem til nå.
+2) Oppdater session-bias for London (bullish, bearish eller nøytral) og forklar hvorfor på en enkel måte.
+3) Beskriv 2 scenarioer videre for London:
+   - Scenario A
+   - Scenario B
+   Forklar hva som MÅ skje før en entry ville gi mening (fra et SMC-perspektiv).
 
-{
-  "bias": "...",
-  "event": "...",
-  "comment": "...",
-  "entry_zone": { "min": null, "max": null },
-  "invalidation": null,
-  "symbol": "...",
-  "timeframe": "...",
-  "analysis_timestamp": "...",
-  "overall_bias": "...",
-  "setups": [
-    {
-      "name": "frankfurt_london_bos_setup_1",
-      "is_valid": false,
-      "direction": null,
-      "legs": {
-        "frankfurt_manipulation": {
-          "found": false,
-          "direction": null,
-          "start_timestamp": null,
-          "end_timestamp": null,
-          "description": ""
-        },
-        "london_sweep": {
-          "found": false,
-          "direction": null,
-          "timestamp": null,
-          "description": ""
-        },
-        "bos_confirmation": {
-          "found": false,
-          "timestamp": null,
-          "structure_type": null,
-          "description": ""
-        }
-      },
-      "entry": {
-        "type": null,
-        "price": null,
-        "zone_high": null,
-        "zone_low": null,
-        "timeframe": null,
-        "reason": ""
-      },
-      "take_profit": {
-        "price": null,
-        "reason": "",
-        "poi_references": []
-      },
-      "stop_loss": {
-        "price": null,
-        "reason": "",
-        "structure_low": null,
-        "structure_high": null,
-        "buffer_pips": null
-      },
-      "comment": "",
-      "confidence": 0
+Skriv:
+- maks 2 korte avsnitt
+- pluss 2 korte bullets (Scenario A og Scenario B).
+Bruk enkelt språk, men du kan bruke ord som "sweep", "inducement", "BOS", "CHOCH" og "likviditet".
+      `;
     }
-  ],
-  "raw_events": []
-}
-    `.trim();
 
-    const userContent = JSON.stringify(smcRequest);
+    const userPrompt = `
+Her er markedsdataene frem til dette tidspunktet (CET):
+${JSON.stringify(smcRequest, null, 2)}
+    `;
 
     // ---------------------------
-    // Kall OpenAI
+    // Kall OpenAI (gpt-4.1-mini)
     // ---------------------------
     const payload = {
       model: "gpt-4.1-mini",
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: userContent }
+        { role: "user", content: userPrompt }
       ],
-      response_format: { type: "json_object" }
+      // vi vil ha ren tekst, ikke JSON
+      temperature: 0.4
     };
 
     const gptRes = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -355,187 +212,33 @@ Svar ALLTID med gyldig JSON i dette formatet:
     }
 
     const gptJson = await gptRes.json();
-    const content = gptJson.choices?.[0]?.message?.content || "{}";
+    const content = gptJson.choices?.[0]?.message?.content || "";
 
     // ---------------------------
-    // Parse analysis
+    // Bygg Telegram-melding
     // ---------------------------
-    let analysis;
-    try {
-      analysis = JSON.parse(content);
-    } catch (e) {
-      console.error("Failed to parse JSON from model:", content);
-      analysis = { raw: content };
+    let header = "";
+    if (reportKind === "0900") {
+      header = `📊 09:00 London morgenrapport – ${smcRequest.symbol || ""}`;
+    } else if (reportKind === "0930") {
+      header = `📊 09:30 London oppdatering – ${smcRequest.symbol || ""}`;
     }
 
-    // ---------------------------
-    // Setup #1: FULL vs PRE med state-maskin
-    // ---------------------------
-    let setupAlertSent = false;
-    try {
-      const setups = analysis?.setups || [];
-      const setupName = "frankfurt_london_bos_setup_1";
-      const setup1 = setups.find(
-        (s) => s && s.name === setupName
-      );
+    const telegramMessage = `${header}\n\n${content}`;
 
-      if (setup1) {
-        const legs = setup1.legs || {};
-        const frankfurt = legs.frankfurt_manipulation || {};
-        const london = legs.london_sweep || {};
-        const bos = legs.bos_confirmation || {};
-
-        const hasFrankfurt = !!frankfurt.found;
-        const hasLondon = !!london.found;
-        const hasBos = !!bos.found;
-        const currentStatus = getSetupStatus(symbol, setupName);
-
-        const preCandidate = hasFrankfurt && hasLondon && !hasBos;
-        const fullCandidate = hasFrankfurt && hasLondon && hasBos;
-
-        const direction = (setup1.direction || "").toUpperCase();
-        const entryPrice = setup1.entry?.price ?? "N/A";
-        const tpPrice = setup1.take_profit?.price ?? "N/A";
-        const slPrice = setup1.stop_loss?.price ?? "N/A";
-        const setupComment = setup1.comment || analysis.comment || "";
-
-        // FULL SETUP: BOS bekreftet
-        if (fullCandidate && currentStatus !== "full") {
-          const msgLines = [
-            "*SMC SETUP #1 (FRANKFURT → LONDON → BOS)*",
-            "",
-            `Symbol: ${analysis.symbol || symbol}`,
-            `Direction: ${direction || "N/A"}`,
-            "",
-            `Entry: ${entryPrice}`,
-            `Take Profit: ${tpPrice}`,
-            `Stop Loss: ${slPrice}`,
-            "",
-            "Frankfurt:",
-            frankfurt.description || "–",
-            "",
-            "London sweep:",
-            london.description || "–",
-            "",
-            "BOS:",
-            bos.description || "–",
-            "",
-            "Kommentar:",
-            setupComment
-          ];
-          const msg = msgLines.join("\n");
-          await sendTelegramMessage(msg);
-          setupAlertSent = true;
-          setSetupStatus(symbol, setupName, "full");
-          console.log("🔔 TELEGRAM ALERT: Setup #1 FULL (med BOS). Status → full");
-        }
-        // PRE-SETUP: Frankfurt + London funnet, ingen BOS ennå
-        else if (preCandidate && currentStatus === "none") {
-          const msgLines = [
-            "*PRE-SETUP #1 (Frankfurt → London, venter på BOS)*",
-            "",
-            `Symbol: ${analysis.symbol || symbol}`,
-            `Direction: ${direction || "N/A"}`,
-            "",
-            `Foreløpig entry (test): ${entryPrice}`,
-            `Foreløpig SL: ${slPrice}`,
-            "",
-            "Frankfurt:",
-            frankfurt.description || "–",
-            "",
-            "London sweep:",
-            london.description || "–",
-            "",
-            "Kommentar:",
-            setupComment || "Venter på tydelig BOS for full bekreftelse."
-          ];
-          const msg = msgLines.join("\n");
-          await sendTelegramMessage(msg);
-          setupAlertSent = true;
-          setSetupStatus(symbol, setupName, "pre");
-          console.log("🔔 TELEGRAM ALERT: PRE-SETUP #1. Status none → pre");
-        } else {
-          console.log(
-            "Setup #1 evaluated. hasFrankfurt:",
-            hasFrankfurt,
-            "hasLondon:",
-            hasLondon,
-            "hasBos:",
-            hasBos,
-            "currentStatus:",
-            currentStatus
-          );
-        }
-      }
-    } catch (e) {
-      console.error("Error while handling Setup #1:", e);
-    }
+    await sendTelegramMessage(telegramMessage);
 
     // ---------------------------
-    // Fallback: enkel CHOCH/BOS i London
-    // ---------------------------
-    const importantEvents = ["choch", "bos"];
-    const eventType = (analysis?.event || "none").toLowerCase();
-    const isImportantEvent = importantEvents.includes(eventType);
-    const londonOK = isInLondonHours();
-    const shouldAlertSimple = isImportantEvent && londonOK && !setupAlertSent;
-
-    if (shouldAlertSimple) {
-      console.log("🔔 TELEGRAM ALERT (simple CHOCH/BOS). Event:", eventType);
-
-      const bias = analysis.bias || "ukjent";
-      const comment = analysis.comment || "";
-      const entryZone = analysis.entry_zone || null;
-      const invalidation = analysis.invalidation ?? null;
-
-      let entryText = "N/A";
-      if (
-        entryZone &&
-        entryZone.min != null &&
-        entryZone.max != null
-      ) {
-        entryText = `${entryZone.min} - ${entryZone.max}`;
-      }
-
-      const invalidationText =
-        invalidation != null ? String(invalidation) : "N/A";
-
-      const msgLines = [
-        "*SMC SIGNAL (London)*",
-        "",
-        `Symbol: ${symbol}`,
-        `Event: ${eventType}`,
-        `Bias: ${bias}`,
-        "",
-        `Comment: ${comment}`,
-        "",
-        `Entry zone: ${entryText}`,
-        `Invalidation: ${invalidationText}`
-      ];
-
-      const msg = msgLines.join("\n");
-      await sendTelegramMessage(msg);
-    } else if (!setupAlertSent) {
-      console.log(
-        "No Telegram alert – event:",
-        eventType,
-        "| London hours:",
-        londonOK
-      );
-    }
-
-    const finalAlertFlag = setupAlertSent || shouldAlertSimple;
-
-    // ---------------------------
-    // Svar tilbake
+    // Svar til TradingView / tester
     // ---------------------------
     return response.status(200).json({
       ok: true,
-      kind: "ltf_tick",
-      alert: finalAlertFlag,
+      report_kind: reportKind,
+      cetHour,
+      minute,
       received: data,
       smc_request: smcRequest,
-      analysis
+      report_text: content
     });
   } catch (err) {
     console.error("Server error:", err);
