@@ -30,16 +30,15 @@ async function sendTelegramMessage(message) {
 }
 
 // -------------------------------
-// HJELPER: finn modus (tick / 09:00 / 09:30) i NORSK TID
-// Antar server-tid ~ UTC og Norge = UTC+1 (vinter).
+// HJELPER: finn modus basert på DATA FRA PINE
 // -------------------------------
-function getAnalysisMode() {
-  const now = new Date();
-  const osloHour = now.getUTCHours() + 1; // CET ~ Europe/Oslo vintertid
-  const minute = now.getUTCMinutes();
-
-  if (osloHour === 9 && minute === 0) return "report_0900";
-  if (osloHour === 9 && minute === 30) return "report_0930";
+function getAnalysisModeFromData(data) {
+  try {
+    if (data.is_0900) return "report_0900";
+    if (data.is_0930) return "report_0930";
+  } catch (e) {
+    console.error("Error reading is_0900 / is_0930 from data:", e);
+  }
   return "tick";
 }
 
@@ -63,7 +62,7 @@ export default async function handler(request, response) {
         .json({ error: "Server missing OPENAI_API_KEY" });
     }
 
-    const mode = getAnalysisMode();
+    const mode = getAnalysisModeFromData(data);
 
     // ---------------------------
     // 1) Systemprompt til modellen
@@ -71,12 +70,16 @@ export default async function handler(request, response) {
     const systemPrompt = `
 Du er en Smart Money Concepts-analytiker for EURUSD.
 
-Du får JSON fra TradingView med én 5m-candle, ferdig beregnede sessionsnivåer og høyere tidsrammer. Strukturen er:
+Du får JSON fra TradingView med én 5m-candle, ferdig beregnede sessionsnivåer og høyere tidsrammer. Strukturen er omtrent:
 
 {
   "symbol": string,
   "timeframe": "5m",
   "time_ms": number,
+  "oslo_hour": number,
+  "oslo_minute": number,
+  "is_0900": boolean,
+  "is_0930": boolean,
   "open": number,
   "high": number,
   "low": number,
@@ -118,19 +121,15 @@ STIL PÅ RAPPORTENE:
 - Rapport-tekstene skal være KORTE og STRUKTURERTE.
 - Bruk alltid følgende struktur i tekst (norsk):
 
-  Asia: kort beskrivelse (1–2 setninger) av hvordan Asia (02–06) har pushet pris og hvor liquidity ligger i forhold til asia_high / asia_low (for eksempel "pushet opp, mye liquidity under higher lows", "bygget tight range, liquidity over high og under low").
-  Frankfurt: kort beskrivelse (1–2 setninger) av om Frankfurt har manipulert opp/ned, tatt likviditet rundt Asia-nivåene, og hvordan dette kan brukes av London. Referer til frankfurt_high / frankfurt_low når tilgjengelig.
-  London: kort vurdering (1–2 setninger) av London-bias (bullish/bearish/nøytral) og hva som må skje (for eksempel sweep + BOS) før et scenario er aktivt. Ikke gi konkrete entries, bare hva London "bør" gjøre før entry gir mening.
-  Mulig daily cycle: én kort label + evt. 1 setning forklaring. Eksempler på labels: "Judas swing", "Asia break & retest", "Asia whipsaw", "Trend day", "Range day". Bruk bare disse typene beskrivelser.
-
-- Bruk linjeskift mellom hver del slik:
-
   Asia: ...
   Frankfurt: ...
   London: ...
   Mulig daily cycle: ...
 
-- Unngå lange avsnitt. Ingen punktlister, bare korte setninger.
+- Asia: 1–2 setninger om hvordan Asia (02–06) har pushet pris og hvor liquidity ligger i forhold til asia_high / asia_low.
+- Frankfurt: 1–2 setninger om manipulering opp/ned, og hvordan liquidity over/under frankfurt_high / frankfurt_low kan brukes av London.
+- London: 1–2 setninger om London-bias (bullish/bearish/nøytral) og hva som må skje (for eksempel sweep + BOS) før et scenario er aktivt.
+- Mulig daily cycle: én kort label + eventuell 1 setning forklaring. Eksempler: "Judas swing", "Asia break & retest", "Asia whipsaw", "Trend day", "Range day".
 
 OPPGAVER:
 
@@ -138,25 +137,20 @@ OPPGAVER:
    - Sett "bias" til en av: "bullish", "bearish", "range", "unclear".
    - Sett "event" til en av: "none", "sweep", "choch", "bos", "frankfurt_manipulation", "london_sweep" eller liknende kort kode.
    - Hvis du ser en naturlig FVG-/struktur-entry, fyll "entry_zone.min" og "entry_zone.max" med priser hentet direkte fra candles i input.
-   - Hvis det finnes et naturlig invalidation-nivå (for eksempel under siste low eller over en tydelig high), fyll "invalidation" med et eksisterende prisnivå.
-   - Skriv "comment" på norsk, 1–3 setninger, kort og teknisk.
-   - "report_0900" og "report_0930" skal i dette tilfellet være null.
+   - Hvis det finnes et naturlig invalidation-nivå, fyll "invalidation" med et eksisterende prisnivå.
+   - "comment": kort norsk tekst (1–3 setninger), teknisk og presis.
+   - "report_0900" og "report_0930" skal være null.
 
 2) Når mode = "report_0900":
-   - Lag en kort morgenrapport på norsk, med nøyaktig denne strukturen:
+   - Lag en kort morgenrapport på norsk med nøyaktig denne strukturen:
 
      Asia: ...
      Frankfurt: ...
      London: ...
      Mulig daily cycle: ...
 
-   - Asia-delen beskriver Asia 02–06 (range/trend, hvor pris ligger i forhold til asia_high/asia_low, liquidity over/under).
-   - Frankfurt-delen beskriver 06–09 (inducement + ev. Frankfurt-manipulasjon).
-   - London-delen sier 1–2 mest sannsynlige scenarier for London (bullish/bearish/mean-reversion) uten å innføre nye prisnivåer utover dem du har fått.
-   - Mulig daily cycle: gi én label og kort forklaring (for eksempel "Asia break & retest – pris har brutt Asia-high og tester nå midten av rangen").
-   - I dette tilfellet skal:
-       * "report_0900" inneholde hele teksten (string)
-       * "report_0930" være null
+   - "report_0900" skal inneholde hele teksten.
+   - "report_0930" skal være null.
 
 3) Når mode = "report_0930":
    - Lag en London-oppdatering på norsk med samme struktur:
@@ -166,13 +160,8 @@ OPPGAVER:
      London: ...
      Mulig daily cycle: ...
 
-   - Asia: veldig kort oppsummering (1 setning) av Asia-range og hvor nåværende pris ligger vs Asia-high/low.
-   - Frankfurt: om det har vært tydelig manipulasjon/sweep rundt Asia-nivåene, samt om Frankfurt sine highs/lows nå fungerer som liquidity for London.
-   - London: hva London faktisk har gjort frem til 09:30 (sweep/CHOCH/BOS eller bare range), og hva som skal til for et mer tydelig scenario.
-   - Mulig daily cycle: oppdatert vurdering av hvilken type dag det ligner mest på (Judas swing, Asia whipsaw, osv).
-   - I dette tilfellet skal:
-       * "report_0930" inneholde teksten
-       * "report_0900" være null
+   - "report_0930" skal inneholde hele teksten.
+   - "report_0900" skal være null.
 
 SVARFORMAT:
 - Svar ALLTID med gyldig JSON på dette formatet:
@@ -260,7 +249,7 @@ SVARFORMAT:
 
     // ---------------------------
     // 6) Enkelt-SMC-signaler (CHOCH/BOS i London-vindu)
-    // ---------------------------
+// ---------------------------
     if (mode === "tick" && analysis && typeof analysis === "object") {
       const importantEvents = ["choch", "bos"];
       const eventType = (analysis.event || "none").toString().toLowerCase();
