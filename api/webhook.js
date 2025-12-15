@@ -1,50 +1,69 @@
 // api/webhook.js
-import { kv } from "@vercel/kv";
+// Lagrer TradingView payload i Upstash (last:SYMBOL + latest:any)
+// + sender 09:00 og 09:30 rapport til Telegram basert på dine prompts (Norsk tid).
 
-async function sendTelegramMessage(chatId, message) {
+async function upstashSet(key, valueObj, ttlSeconds = 172800) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) throw new Error("Missing UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN");
+
+  const endpoint = `${url}/set/${encodeURIComponent(key)}`;
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    // Upstash REST /set tar JSON body = value. Vi legger inn payload direkte.
+    body: JSON.stringify(valueObj),
+  });
+
+  if (!resp.ok) throw new Error(`Upstash SET failed: ${resp.status} ${await resp.text()}`);
+
+  // Sett TTL (expire) i egen call for å være sikker
+  const exp = await fetch(`${url}/expire/${encodeURIComponent(key)}/${ttlSeconds}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  // ikke hard-fail på expire
+  if (!exp.ok) console.warn("Upstash EXPIRE failed:", await exp.text());
+}
+
+async function upstashGet(key) {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) throw new Error("Missing UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN");
+
+  const resp = await fetch(`${url}/get/${encodeURIComponent(key)}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`Upstash GET failed: ${resp.status} ${await resp.text()}`);
+  const data = await resp.json(); // { result: ... }
+  return data?.result ?? null;
+}
+
+async function sendTelegramMessage(text) {
   const token = process.env.TELEGRAM_TOKEN;
-  if (!token) throw new Error("Missing TELEGRAM_TOKEN");
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) throw new Error("Missing TELEGRAM_TOKEN / TELEGRAM_CHAT_ID");
 
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const r = await fetch(url, {
+  const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
-      text: message,
+      text,
       parse_mode: "Markdown",
       disable_web_page_preview: true,
     }),
   });
 
-  if (!r.ok) throw new Error(`Telegram sendMessage failed: ${await r.text()}`);
+  if (!resp.ok) throw new Error(`Telegram sendMessage failed: ${resp.status} ${await resp.text()}`);
 }
 
-async function callOpenAI({ apiKey, systemPrompt, userContent }) {
-  const payload = {
-    model: "gpt-4.1-mini",
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userContent },
-    ],
-  };
-
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!r.ok) throw new Error(await r.text());
-  const j = await r.json();
-  return j.choices?.[0]?.message?.content || "";
-}
-
-function getOsloParts(timeMs) {
-  // timeMs = epoch ms
+function getOsloPartsFromMs(ms) {
+  // Returnerer { yyyy, mm, dd, hh, min } i Europe/Oslo
   const dtf = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/Oslo",
     year: "numeric",
@@ -55,26 +74,21 @@ function getOsloParts(timeMs) {
     hour12: false,
   });
 
-  const parts = dtf.formatToParts(new Date(timeMs));
-  const map = {};
-  for (const p of parts) map[p.type] = p.value;
-
-  const yyyy = map.year;
-  const mm = map.month;
-  const dd = map.day;
-  const hh = Number(map.hour);
-  const min = Number(map.minute);
+  const parts = dtf.formatToParts(new Date(Number(ms)));
+  const m = {};
+  for (const p of parts) if (p.type !== "literal") m[p.type] = p.value;
 
   return {
-    dateKey: `${yyyy}-${mm}-${dd}`, // Oslo-date
-    hh,
-    min,
+    yyyy: Number(m.year),
+    mm: Number(m.month),
+    dd: Number(m.day),
+    hh: Number(m.hour),
+    min: Number(m.minute),
   };
 }
 
-function buildPrompt_0900() {
-  return `
-09:00 LONDON-FORBEREDELSE
+function build0900Prompt() {
+  return `09:00 LONDON-FORBEREDELSE
 
 Du er en erfaren SMC-trader.
 Skriv en kort, presis London-forberedelse kl. 09:00 norsk tid.
@@ -114,7 +128,8 @@ POI:
 
 Beskriv:
 - Hva MÅ skje før en gyldig London-setup kan starte
-- Hva bør ignoreres
+  (f.eks: London må sweep Frankfurt low før bullish continuation)
+- Hva bør ignoreres (støy, tidlig breakout, Asia-range chop)
 - Mulige strukturer som kan formes:
   - W / M-pattern
   - Inducement før sweep
@@ -125,16 +140,15 @@ Beskriv:
 
 - Session-bias for London basert på 15m / 1H struktur
 - Kort hypotese om mest sannsynlig rekkefølge (1–2 setninger maks)
+  (f.eks: først mitigate 1H FVG → deretter reversal i tråd med HTF-bias)
 
 Språk:
 - Bruk kun nødvendige begreper: Asia / Frankfurt / High / Low / Mid / Manipulation / Sweep / BOS / CHOCH / Inducement
-- Hvis du bruker “inducement”: si NÅR og HVOR den oppsto.
-`.trim();
+- Hvis du bruker “inducement”: si NÅR og HVOR den oppsto.`;
 }
 
-function buildPrompt_0930() {
-  return `
-09:30 ALERT – LONDON UPDATE
+function build0930Prompt() {
+  return `09:30 ALERT – LONDON UPDATE
 
 Du er en SMC-trader som gir en kort, presis London-oppdatering kl 09:30.
 
@@ -185,22 +199,29 @@ Frankfurt (08–09):
 
 Scenario A – Frankfurt manipulation finnes:
 - Hva MÅ skje videre for gyldig setup?
+  (f.eks: BOS over/under X etter sweep)
 - Hva bør ignoreres?
+  (f.eks: små wicks / range-støy)
 - Typisk modell:
   Judas / W / M / Sweep → BOS → Continuation
 
 Scenario B – Frankfurt er DØD:
 - Hva er Londons rolle nå?
+  (f.eks: London skaper egen manipulation)
 - Hvilke signaler er gyldige å følge?
+  (f.eks: London-sweep + BOS uten Frankfurt)
 - Hva MÅ bekreftes før man vurderer entry?
+  (strukturbrudd, retest, clean impuls)
 
 ────────────────────
 4) BIAS
 ────────────────────
 
 - London session-bias: Bullish / Bearish / Nøytral
-- Begrunnelse: (struktur + liquidity + HTF-kontekst)
-- Daily bias (kort): samsvarer / divergerer fra London?
+- Begrunnelse:
+  (struktur + liquidity + HTF-kontekst)
+- Daily bias (kort):
+  samsvarer / divergerer fra London?
 
 ────────────────────
 5) HVA DU BØR SE ETTER VIDERE
@@ -230,104 +251,92 @@ Da:
 
 Ikke gi trade-størrelse.
 Ikke gi RR.
-Ikke gi flere entries.
-`.trim();
+Ikke gi flere entries.`;
+}
+
+async function callOpenAI({ prompt, state }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+
+  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
+  const system = `Du følger instruksene i prompten strengt.
+VIKTIG: Bruk KUN tall som finnes i state-JSON. Ikke gjett nivåer.
+Svar på norsk.`;
+
+  const user = `PROMPT:
+${prompt}
+
+STATE (JSON):
+${JSON.stringify(state).slice(0, 240000)}`;
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+      max_tokens: 700,
+    }),
+  });
+
+  if (!r.ok) throw new Error(`OpenAI failed: ${r.status} ${await r.text()}`);
+  const j = await r.json();
+  return (j.choices?.[0]?.message?.content || "").trim();
 }
 
 export default async function handler(req, res) {
   try {
-    // “Er du oppe?”
-    if (req.method === "GET") {
-      return res.status(200).json({ ok: true, message: "webhook alive" });
-    }
-
-    if (req.method !== "POST") {
-      return res.status(405).json({ ok: false, error: "Method not allowed" });
-    }
+    // "Alive" check
+    if (req.method === "GET") return res.status(200).json({ ok: true, message: "webhook alive" });
+    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
     const payload = req.body || {};
     const symbol = payload?.symbol || "unknown";
-    const timeMs = Number(payload?.time_ms);
+    const key = `last:${symbol}`;
 
-    if (!timeMs || Number.isNaN(timeMs)) {
-      return res.status(400).json({ ok: false, error: "Missing/invalid time_ms in payload" });
+    // LAGRE payload
+    await upstashSet(key, payload, 172800);        // 2 døgn
+    await upstashSet("latest:any", payload, 172800);
+
+    // Tidsstyring (norsk tid) basert på payload.time_ms (ms)
+    const timeMs = payload?.time_ms;
+    if (typeof timeMs !== "number") {
+      return res.status(200).json({ ok: true, stored: true, key, note: "No time_ms in payload; skipped scheduled alerts." });
     }
 
-    // 1) Lagre “latest” slik at /ask kan bruke den
-    await kv.set("latest:any", payload);
-    await kv.set(`latest:${symbol}`, payload);
+    const t = getOsloPartsFromMs(timeMs);
+    const dateKey = `${t.yyyy}-${String(t.mm).padStart(2, "0")}-${String(t.dd).padStart(2, "0")}`;
 
-    // 2) Sjekk Oslo-tid
-    const { dateKey, hh, min } = getOsloParts(timeMs);
+    // Trigger kun på 09:00 og 09:30 (Oslo)
+    const is0900 = (t.hh === 9 && t.min === 0);
+    const is0930 = (t.hh === 9 && t.min === 30);
 
-    // 3) Kun send rapporter på eksakt 09:00 og 09:30 (Oslo)
-    const is0900 = hh === 9 && min === 0;
-    const is0930 = hh === 9 && min === 30;
+    // Anti-dupe (per dag)
+    if (is0900 || is0930) {
+      const sentKey = `sent:${symbol}:${dateKey}:${is0900 ? "0900" : "0930"}`;
+      const already = await upstashGet(sentKey);
 
-    // Hvem skal få rapportene?
-    const reportChatId = process.env.TELEGRAM_CHAT_ID; // samme chat du bruker for alerts
-    const apiKey = process.env.OPENAI_API_KEY;
-
-    // Hvis du ikke har satt disse, så lagrer vi fortsatt candles, men sender ikke rapport
-    if ((!reportChatId || !apiKey) && (is0900 || is0930)) {
-      // ikke kast error – bare returner OK
-      return res.status(200).json({
-        ok: true,
-        stored: true,
-        note: "Missing TELEGRAM_CHAT_ID or OPENAI_API_KEY so reports are not sent",
-      });
-    }
-
-    // 4) “Send bare én gang per dag”
-    if (is0900) {
-      const sentKey = `sent:${dateKey}:0900`;
-      const already = await kv.get(sentKey);
       if (!already) {
-        const prompt = buildPrompt_0900();
-        const answer = await callOpenAI({
-          apiKey,
-          systemPrompt: prompt,
-          userContent: JSON.stringify(payload),
-        });
+        const prompt = is0900 ? build0900Prompt() : build0930Prompt();
+        const answer = await callOpenAI({ prompt, state: payload });
 
-        const msg = `*09:00 London-forberedelse – ${symbol}*\n\n${answer}`.trim();
-        await sendTelegramMessage(reportChatId, msg);
+        const header = is0900 ? `*09:00 London-forberedelse – ${symbol}*` : `*09:30 London update – ${symbol}*`;
+        const msg = `${header}\n\n${answer}`;
 
-        // marker sendt (TTL 3 døgn)
-        await kv.set(sentKey, true, { ex: 60 * 60 * 24 * 3 });
+        await sendTelegramMessage(msg);
+
+        // Marker som sendt (TTL 48t)
+        await upstashSet(sentKey, { sent: true, at_ms: timeMs }, 172800);
       }
     }
 
-    if (is0930) {
-      const sentKey = `sent:${dateKey}:0930`;
-      const already = await kv.get(sentKey);
-      if (!already) {
-        const prompt = buildPrompt_0930();
-        const answer = await callOpenAI({
-          apiKey,
-          systemPrompt: prompt,
-          userContent: JSON.stringify(payload),
-        });
-
-        const msg = `*09:30 London update – ${symbol}*\n\n${answer}`.trim();
-        await sendTelegramMessage(reportChatId, msg);
-
-        await kv.set(sentKey, true, { ex: 60 * 60 * 24 * 3 });
-      }
-    }
-
-    return res.status(200).json({
-      ok: true,
-      stored: true,
-      symbol,
-      oslo_time: { hh, min, dateKey },
-      sent: { is0900, is0930 },
-    });
+    return res.status(200).json({ ok: true, stored: true, key, received_symbol: symbol });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "Server error",
-      details: String(err?.message || err),
-    });
+    return res.status(500).json({ ok: false, error: "Server error", details: String(err?.message || err) });
   }
 }
