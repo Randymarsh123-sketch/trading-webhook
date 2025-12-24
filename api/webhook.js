@@ -1,6 +1,7 @@
 // api/webhook.js
 // Lagrer TradingView payload i Upstash (last:SYMBOL + latest:any)
 // + sender 09:00 og 09:30 rapport til Telegram basert på nye Daily-cycle prompts (Norsk tid).
+// + TESTMODE: manual trigger via query param (?test=0900|0930&symbol=EURUSD) som bruker siste lagrede state.
 
 async function upstashSet(key, valueObj, ttlSeconds = 172800) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -325,6 +326,32 @@ export default async function handler(req, res) {
     // LAGRE payload
     await upstashSet(key, payload, 172800);        // 2 døgn
     await upstashSet("latest:any", payload, 172800);
+
+    // ─────────────────────────────
+    // TESTMODE (manual trigger)
+    // Bruk: POST /api/webhook?test=0900&symbol=EURUSD
+    //   eller POST /api/webhook?test=0930&symbol=EURUSD
+    // Bruker siste lagrede payload fra Upstash (last:<symbol>)
+    // Påvirker ikke normal 09:00/09:30-scheduler når den ikke brukes.
+    // ─────────────────────────────
+    const test = String(req.query?.test || "").toLowerCase(); // "0900" eller "0930"
+    const testSymbol = String(req.query?.symbol || symbol || "EURUSD").toUpperCase();
+
+    if (test === "0900" || test === "0930") {
+      const latest = await upstashGet(`last:${testSymbol}`);
+      if (!latest) return res.status(200).json({ ok: false, note: `No data for last:${testSymbol}` });
+
+      const prompt = test === "0900" ? build0900Prompt() : build0930Prompt();
+      const answer = await callOpenAI({ prompt, state: latest });
+
+      const header = test === "0900"
+        ? `*TEST 09:00 – ${testSymbol}*`
+        : `*TEST 09:30 – ${testSymbol}*`;
+
+      await sendTelegramMessage(`${header}\n\n${answer}`);
+
+      return res.status(200).json({ ok: true, test: true, which: test, symbol: testSymbol });
+    }
 
     // Tidsstyring (norsk tid) basert på payload.time_ms (ms)
     const timeMs = payload?.time_ms;
