@@ -99,6 +99,20 @@ VIKTIG:
 - Svar kort og konkret. Stikkord er OK.
 - Ingen entries. Ingen trade-forslag.
 
+DATA I STATE:
+- 5m live candle ligger på root: open/high/low/close/time_ms
+- HTF arrays ligger i: state.htf_data.m15 / state.htf_data.h1 / state.htf_data.d1
+- HTF-arrays er sortert: eldste → nyeste
+- Daily (d1): nyeste candle kan være dagens pågående (ikke lukket). Hvis du trenger "forrige lukket daily", bruk candle før nyeste.
+
+────────────────────
+0) DAILY (kontekst / bias)
+- Bruk Daily-candles (d1) for å gi en kort HTF-kontekst (1–2 setninger maks).
+- Pek på:
+  - Om dagens/lukket daily viser clear bullish/bearish body, eller er nøytral/inside.
+  - Relevante nivåer fra Daily som er viktig inn i London (f.eks. forrige daily high/low), men KUN hvis tall finnes direkte i d1-candles.
+- Ikke finn på “PDH/PDL” hvis du ikke kan peke på eksakt d1-candle og high/low derfra.
+
 ────────────────────
 1) ASIA (02:00–06:00)
 
@@ -139,6 +153,7 @@ Beskriv:
 4) BIAS
 
 - Session-bias for London basert på 15m / 1H struktur
+- Daily-kontekst: samsvarer / divergerer (1 kort setning)
 - Kort hypotese om mest sannsynlig rekkefølge (1–2 setninger maks)
   (f.eks: først mitigate 1H FVG → deretter reversal i tråd med HTF-bias)
 
@@ -158,9 +173,18 @@ VIKTIG:
 - Svar kort og konkret (stikkord / korte setninger).
 - Målet er oversikt og forberedelse – ikke trade-management.
 
+DATA I STATE:
+- HTF arrays: state.htf_data.m15 / state.htf_data.h1 / state.htf_data.d1
+- HTF-arrays er sortert: eldste → nyeste
+- Daily (d1): nyeste candle kan være dagens pågående (ikke lukket). Hvis du trenger "forrige lukket daily", bruk candle før nyeste.
+
 ────────────────────
 1) STATUS FREM TIL 09:30
 ────────────────────
+
+Daily (kort, kun hvis nyttig):
+- 1 setning: daily-kontekst (bullish/bearish/nøytral) basert på d1 candles
+- Hvis du nevner nivåer: referer til eksakt d1 high/low/close (ikke “gjetting”)
 
 Asia:
 - Klassifisering (velg én): 
@@ -221,7 +245,7 @@ Scenario B – Frankfurt er DØD:
 - Begrunnelse:
   (struktur + liquidity + HTF-kontekst)
 - Daily bias (kort):
-  samsvarer / divergerer fra London?
+  samsvarer / divergerer fra London? (maks 1 setning)
 
 ────────────────────
 5) HVA DU BØR SE ETTER VIDERE
@@ -261,7 +285,9 @@ async function callOpenAI({ prompt, state }) {
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
   const system = `Du følger instruksene i prompten strengt.
-VIKTIG: Bruk KUN tall som finnes i state-JSON. Ikke gjett nivåer.
+VIKTIG:
+- Bruk KUN tall som finnes i state-JSON. Ikke gjett nivåer.
+- Hvis du refererer til Daily: bruk state.htf_data.d1 candles (eldste→nyeste). Nyeste kan være pågående.
 Svar på norsk.`;
 
   const user = `PROMPT:
