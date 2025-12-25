@@ -1,10 +1,13 @@
 // api/webhook.js
 // Stores TradingView payload in Upstash (last:SYMBOL + latest:any)
 // Sends 09:00 and 09:30 Telegram alerts (Europe/Oslo)
-// TESTING:
-//   1) Live latest:  POST ?test=0930&symbol=EURUSD
-//   2) Sandbox dataset: POST ?test=0930&dataset=dataset:EURUSD:5d&at=2025-12-15T09:30:00+01:00
-//                     or POST ?test=0930&dataset=dataset:EURUSD:5d&at_ms=1765758600000
+//
+// TESTING (after deploy):
+//  - Live latest (uses last:SYMBOL):
+//      POST /api/webhook?test=0930&symbol=EURUSD
+//  - Sandbox dataset (uses dataset key + time):
+//      POST /api/webhook?test=0930&dataset=dataset:EURUSD:5d&at_ms=1734337800000
+//      (recommended: always use at_ms to avoid URL timezone parsing issues)
 
 async function upstashSet(key, valueObj, ttlSeconds = 172800) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -18,11 +21,13 @@ async function upstashSet(key, valueObj, ttlSeconds = 172800) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
+    // Upstash REST /set takes JSON body as the value
     body: JSON.stringify(valueObj),
   });
 
   if (!resp.ok) throw new Error(`Upstash SET failed: ${resp.status} ${await resp.text()}`);
 
+  // TTL (expire)
   const exp = await fetch(`${url}/expire/${encodeURIComponent(key)}/${ttlSeconds}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
@@ -39,9 +44,29 @@ async function upstashGet(key) {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
   });
+
   if (!resp.ok) throw new Error(`Upstash GET failed: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json();
-  return data?.result ?? null;
+  const data = await resp.json(); // { result: ... }
+  const result = data?.result ?? null;
+
+  // IMPORTANT: Upstash REST often returns stored JSON as a STRING.
+  // Make it robust: parse JSON strings automatically.
+  if (typeof result === "string") {
+    const s = result.trim();
+    if (
+      (s.startsWith("{") && s.endsWith("}")) ||
+      (s.startsWith("[") && s.endsWith("]"))
+    ) {
+      try {
+        return JSON.parse(s);
+      } catch {
+        // if parsing fails, return raw string
+        return result;
+      }
+    }
+  }
+
+  return result;
 }
 
 async function sendTelegramMessage(text) {
@@ -89,14 +114,14 @@ function getOsloPartsFromMs(ms) {
 }
 
 function parseAtMsFromQuery(req) {
-  // Prefer at_ms (simple)
+  // Prefer at_ms (most robust)
   const atMsRaw = req.query?.at_ms;
   if (atMsRaw !== undefined) {
     const n = Number(atMsRaw);
     if (Number.isFinite(n) && n > 0) return Math.trunc(n);
   }
 
-  // Or at=ISO-8601 with offset/Z, e.g. 2025-12-15T09:30:00+01:00
+  // Alternative: at=ISO-8601 (but can be tricky due to URL encoding of '+')
   const at = String(req.query?.at || "").trim();
   if (!at) return null;
 
@@ -107,7 +132,7 @@ function parseAtMsFromQuery(req) {
 }
 
 function findLastCandleAtOrBefore(arr, atMs) {
-  // arr: [{ts,o,h,l,c,v}, ...] sorted oldest->newest
+  // arr sorted oldest->newest, items: {ts,o,h,l,c,v}
   let lo = 0, hi = arr.length - 1, ans = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
@@ -115,7 +140,9 @@ function findLastCandleAtOrBefore(arr, atMs) {
     if (t <= atMs) {
       ans = mid;
       lo = mid + 1;
-    } else hi = mid - 1;
+    } else {
+      hi = mid - 1;
+    }
   }
   return ans;
 }
@@ -161,13 +188,12 @@ function buildStateFromDataset(dataset, atMs) {
   if (idx5 < 0) throw new Error("No m5 candle at/before atMs in dataset");
   const last5 = m5[idx5];
 
-  // Oslo date parts for session slicing
   const t = getOsloPartsFromMs(atMs);
   const yyyy = t.yyyy;
   const mm = t.mm;
   const dd = t.dd;
 
-  // Grab all m5 candles for this Oslo day
+  // All m5 candles for this Oslo day
   const m5SameDay = [];
   for (const c of m5) {
     const p = getOsloPartsFromMs(c.ts);
@@ -191,7 +217,7 @@ function buildStateFromDataset(dataset, atMs) {
   const frankfurtHigh = frCandles.length ? maxHigh(frCandles) : null;
   const frankfurtLow = frCandles.length ? minLow(frCandles) : null;
 
-  const londonWindow = (t.hh === 9 && t.min < 30);
+  const londonWindow = t.hh === 9 && t.min < 30;
 
   return {
     symbol,
@@ -208,7 +234,7 @@ function buildStateFromDataset(dataset, atMs) {
     frankfurt_low: frankfurtLow,
     in_london_window: londonWindow,
     htf_data: {
-      // We keep m15 empty for now (your new model uses Daily + 1H + 5m).
+      // Your new model uses Daily + 1H + 5m; keep m15 empty for now.
       m15: [],
       h1: sliceCandlesUpTo(h1, atMs, 72).map((x) => ({
         timestamp: Number(x.ts),
@@ -230,6 +256,8 @@ function buildStateFromDataset(dataset, atMs) {
   };
 }
 
+// ===== PROMPTS =====
+// Keep these as-is for now; you can tweak wording later.
 function build0900Prompt() {
   return `ALERT 09:00 (Europe/Oslo) – EURUSD Early-Cycle Context
 
@@ -495,14 +523,16 @@ export default async function handler(req, res) {
     // ─────────────────────────────
     const timeMs = payload?.time_ms;
     if (typeof timeMs !== "number") {
-      return res.status(200).json({ ok: true, stored: true, key, note: "No time_ms in payload; skipped scheduled alerts." });
+      return res
+        .status(200)
+        .json({ ok: true, stored: true, key, note: "No time_ms in payload; skipped scheduled alerts." });
     }
 
     const t = getOsloPartsFromMs(timeMs);
     const dateKey = `${t.yyyy}-${String(t.mm).padStart(2, "0")}-${String(t.dd).padStart(2, "0")}`;
 
-    const is0900 = (t.hh === 9 && t.min === 0);
-    const is0930 = (t.hh === 9 && t.min === 30);
+    const is0900 = t.hh === 9 && t.min === 0;
+    const is0930 = t.hh === 9 && t.min === 30;
 
     if (is0900 || is0930) {
       const sentKey = `sent:${symbol}:${dateKey}:${is0900 ? "0900" : "0930"}`;
@@ -512,7 +542,10 @@ export default async function handler(req, res) {
         const prompt = is0900 ? build0900Prompt() : build0930Prompt();
         const answer = await callOpenAI({ prompt, state: payload });
 
-        const header = is0900 ? `*09:00 London-forberedelse – ${symbol}*` : `*09:30 London update – ${symbol}*`;
+        const header = is0900
+          ? `*09:00 London-forberedelse – ${symbol}*`
+          : `*09:30 London update – ${symbol}*`;
+
         await sendTelegramMessage(`${header}\n\n${answer}`);
 
         await upstashSet(sentKey, { sent: true, at_ms: timeMs }, 172800);
