@@ -1,7 +1,10 @@
 // api/webhook.js
-// Lagrer TradingView payload i Upstash (last:SYMBOL + latest:any)
-// + sender 09:00 og 09:30 rapport til Telegram basert på nye Daily-cycle prompts (Norsk tid).
-// + TESTMODE: manual trigger via query param (?test=0900|0930&symbol=EURUSD) som bruker siste lagrede state.
+// Stores TradingView payload in Upstash (last:SYMBOL + latest:any)
+// Sends 09:00 and 09:30 Telegram alerts (Europe/Oslo)
+// TESTING:
+//   1) Live latest:  POST ?test=0930&symbol=EURUSD
+//   2) Sandbox dataset: POST ?test=0930&dataset=dataset:EURUSD:5d&at=2025-12-15T09:30:00+01:00
+//                     or POST ?test=0930&dataset=dataset:EURUSD:5d&at_ms=1765758600000
 
 async function upstashSet(key, valueObj, ttlSeconds = 172800) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -15,18 +18,15 @@ async function upstashSet(key, valueObj, ttlSeconds = 172800) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    // Upstash REST /set tar JSON body = value. Vi legger inn payload direkte.
     body: JSON.stringify(valueObj),
   });
 
   if (!resp.ok) throw new Error(`Upstash SET failed: ${resp.status} ${await resp.text()}`);
 
-  // Sett TTL (expire) i egen call for å være sikker
   const exp = await fetch(`${url}/expire/${encodeURIComponent(key)}/${ttlSeconds}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
-  // ikke hard-fail på expire
   if (!exp.ok) console.warn("Upstash EXPIRE failed:", await exp.text());
 }
 
@@ -40,7 +40,7 @@ async function upstashGet(key) {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!resp.ok) throw new Error(`Upstash GET failed: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json(); // { result: ... }
+  const data = await resp.json();
   return data?.result ?? null;
 }
 
@@ -64,7 +64,7 @@ async function sendTelegramMessage(text) {
 }
 
 function getOsloPartsFromMs(ms) {
-  // Returnerer { yyyy, mm, dd, hh, min } i Europe/Oslo
+  // Returns { yyyy, mm, dd, hh, min } in Europe/Oslo
   const dtf = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/Oslo",
     year: "numeric",
@@ -85,6 +85,148 @@ function getOsloPartsFromMs(ms) {
     dd: Number(m.day),
     hh: Number(m.hour),
     min: Number(m.minute),
+  };
+}
+
+function parseAtMsFromQuery(req) {
+  // Prefer at_ms (simple)
+  const atMsRaw = req.query?.at_ms;
+  if (atMsRaw !== undefined) {
+    const n = Number(atMsRaw);
+    if (Number.isFinite(n) && n > 0) return Math.trunc(n);
+  }
+
+  // Or at=ISO-8601 with offset/Z, e.g. 2025-12-15T09:30:00+01:00
+  const at = String(req.query?.at || "").trim();
+  if (!at) return null;
+
+  const d = new Date(at);
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return null;
+  return ms;
+}
+
+function findLastCandleAtOrBefore(arr, atMs) {
+  // arr: [{ts,o,h,l,c,v}, ...] sorted oldest->newest
+  let lo = 0, hi = arr.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const t = Number(arr[mid]?.ts);
+    if (t <= atMs) {
+      ans = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return ans;
+}
+
+function sliceCandlesUpTo(arr, atMs, count) {
+  const idx = findLastCandleAtOrBefore(arr, atMs);
+  if (idx < 0) return [];
+  const start = Math.max(0, idx - (count - 1));
+  return arr.slice(start, idx + 1);
+}
+
+function maxHigh(arr) {
+  let m = null;
+  for (const x of arr) {
+    const h = Number(x?.h);
+    if (!Number.isFinite(h)) continue;
+    if (m === null || h > m) m = h;
+  }
+  return m;
+}
+
+function minLow(arr) {
+  let m = null;
+  for (const x of arr) {
+    const l = Number(x?.l);
+    if (!Number.isFinite(l)) continue;
+    if (m === null || l < m) m = l;
+  }
+  return m;
+}
+
+function buildStateFromDataset(dataset, atMs) {
+  const symbol = dataset?.meta?.symbol || "EURUSD";
+  const m5 = dataset?.m5 || [];
+  const h1 = dataset?.h1 || [];
+  const d1 = dataset?.d1 || [];
+
+  if (!Array.isArray(m5) || m5.length === 0) throw new Error("Dataset missing m5[]");
+  if (!Array.isArray(h1) || h1.length === 0) throw new Error("Dataset missing h1[]");
+  if (!Array.isArray(d1) || d1.length === 0) throw new Error("Dataset missing d1[]");
+
+  const idx5 = findLastCandleAtOrBefore(m5, atMs);
+  if (idx5 < 0) throw new Error("No m5 candle at/before atMs in dataset");
+  const last5 = m5[idx5];
+
+  // Oslo date parts for session slicing
+  const t = getOsloPartsFromMs(atMs);
+  const yyyy = t.yyyy;
+  const mm = t.mm;
+  const dd = t.dd;
+
+  // Grab all m5 candles for this Oslo day
+  const m5SameDay = [];
+  for (const c of m5) {
+    const p = getOsloPartsFromMs(c.ts);
+    if (p.yyyy === yyyy && p.mm === mm && p.dd === dd) m5SameDay.push(c);
+  }
+
+  // Asia: 02:00–06:59
+  const asiaCandles = m5SameDay.filter((c) => {
+    const p = getOsloPartsFromMs(c.ts);
+    return p.hh >= 2 && p.hh <= 6;
+  });
+
+  // Frankfurt: 08:00–08:59
+  const frCandles = m5SameDay.filter((c) => {
+    const p = getOsloPartsFromMs(c.ts);
+    return p.hh === 8;
+  });
+
+  const asiaHigh = asiaCandles.length ? maxHigh(asiaCandles) : null;
+  const asiaLow = asiaCandles.length ? minLow(asiaCandles) : null;
+  const frankfurtHigh = frCandles.length ? maxHigh(frCandles) : null;
+  const frankfurtLow = frCandles.length ? minLow(frCandles) : null;
+
+  const londonWindow = (t.hh === 9 && t.min < 30);
+
+  return {
+    symbol,
+    timeframe: "5m",
+    time_ms: Number(last5.ts),
+    open: Number(last5.o),
+    high: Number(last5.h),
+    low: Number(last5.l),
+    close: Number(last5.c),
+    volume: Number(last5.v ?? 0),
+    asia_high: asiaHigh,
+    asia_low: asiaLow,
+    frankfurt_high: frankfurtHigh,
+    frankfurt_low: frankfurtLow,
+    in_london_window: londonWindow,
+    htf_data: {
+      // We keep m15 empty for now (your new model uses Daily + 1H + 5m).
+      m15: [],
+      h1: sliceCandlesUpTo(h1, atMs, 72).map((x) => ({
+        timestamp: Number(x.ts),
+        open: Number(x.o),
+        high: Number(x.h),
+        low: Number(x.l),
+        close: Number(x.c),
+        volume: Number(x.v ?? 0),
+      })),
+      d1: sliceCandlesUpTo(d1, atMs, 25).map((x) => ({
+        timestamp: Number(x.ts),
+        open: Number(x.o),
+        high: Number(x.h),
+        low: Number(x.l),
+        close: Number(x.c),
+        volume: Number(x.v ?? 0),
+      })),
+    },
   };
 }
 
@@ -256,37 +398,24 @@ async function callOpenAI({ prompt, state }) {
 
 KRITISK:
 - Bruk KUN tall som finnes i state-JSON. Ikke gjett nivåer.
-- Hvis noe mangler i state (f.eks. d1/h1/m15), skriv "ukjent (mangler data)".
+- Hvis noe mangler i state, skriv "unknown (missing data)".
 - Ikke referer til fremtidige candles.
 - Tidssone: Europe/Oslo.
 
-DATAKILDER:
+DATA:
 - 5m live candle: state.open/high/low/close/time_ms
-- Asia/Frankfurt nivåer: state.asia_high, state.asia_low, state.frankfurt_high, state.frankfurt_low
-- HTF: state.htf_data.h1 (1H), state.htf_data.d1 (Daily), state.htf_data.m15 (15m)
-- HTF-arrays er sortert: eldste → nyeste
-- Daily (d1): nyeste candle kan være dagens pågående (ikke lukket). For "gårsdagens candle (D-1)" og "dagen før (D-2)", bruk de to siste LUKKEDE daily candles:
-  - D-1 = siste daily candle som er ferdig (normalt d1[-2] hvis d1[-1] er pågående)
-  - D-2 = candle før den.
+- Asia/Frankfurt: state.asia_high/asia_low/frankfurt_high/frankfurt_low
+- HTF: state.htf_data.h1 (1H), state.htf_data.d1 (Daily)
+- Daily (d1): nyeste candle kan være pågående. For D-1/D-2: bruk de to siste LUKKEDE daily candles.
 
-REGLER SOM MÅ FØLGES:
-- Daily score/bias: kun D-1 og D-2 (daily OHLC).
-- Score=1 => NO TRADE og avslutt vurderinger (men du kan fortsatt beskrive hva som skjer).
-- NO TRADE hvis både Asia High og Asia Low blir tatt mellom 07:00 og 10:00 (wick er nok).
-- FVG: kun Daily FVG og 1H FVG. Kun unmitigated. Brukes kun som nøytral forventning ("kan fungere som magnet"), aldri som krav, aldri nivå-gjetting.
-- 1H brukes aldri som trigger, kun kontekst og FVG-identifikasjon.
-- Daily cycle regime må velges deterministisk i denne rekkefølgen:
-  1) Asian Whipsaw (begge Asia-sider tatt med wick før 10:00)
-  2) Asia Break-And-Retest (acceptance-break før 09:30 med close-regler)
-  3) Judas Swing (eligibility + senere motsatt side før 14:00)
-  4) Dead-Frankfurt (hvis ingen av de over)
-- Wick vs close:
-  - "tatt" / sweep = wick utenfor Asia-range er nok
-  - "break/acceptance" = close utenfor Asia High/Low (ikke wick).
+WICK vs CLOSE:
+- "taken/sweep" = wick beyond level is enough
+- "break/acceptance" = close beyond level (wick alone doesn't count)
 
 Språk:
-- Svar på engelsk (slik output-formatet er skrevet), kort og praktisk.
-- Ikke foreslå RR, lot, trade management. Ikke "entry" med mindre prompten eksplisitt åpner for det (den gjør det ikke her).`;
+- Output MUST follow the template headings.
+- Answer in English (template is English).
+- No RR, no lot size, no trade management.`;
 
   const user = `PROMPT:
 ${prompt}
@@ -315,45 +444,55 @@ ${JSON.stringify(state).slice(0, 240000)}`;
 
 export default async function handler(req, res) {
   try {
-    // "Alive" check
+    // Alive check
     if (req.method === "GET") return res.status(200).json({ ok: true, message: "webhook alive" });
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
+    // Always store incoming TradingView payload (normal mode)
     const payload = req.body || {};
     const symbol = payload?.symbol || "unknown";
     const key = `last:${symbol}`;
 
-    // LAGRE payload
-    await upstashSet(key, payload, 172800);        // 2 døgn
+    await upstashSet(key, payload, 172800);
     await upstashSet("latest:any", payload, 172800);
 
     // ─────────────────────────────
-    // TESTMODE (manual trigger)
-    // Bruk: POST /api/webhook?test=0900&symbol=EURUSD
-    //   eller POST /api/webhook?test=0930&symbol=EURUSD
-    // Bruker siste lagrede payload fra Upstash (last:<symbol>)
-    // Påvirker ikke normal 09:00/09:30-scheduler når den ikke brukes.
+    // TESTMODE
     // ─────────────────────────────
-    const test = String(req.query?.test || "").toLowerCase(); // "0900" eller "0930"
+    const test = String(req.query?.test || "").toLowerCase(); // "0900" or "0930"
+    const datasetKey = String(req.query?.dataset || "").trim();
     const testSymbol = String(req.query?.symbol || symbol || "EURUSD").toUpperCase();
 
     if (test === "0900" || test === "0930") {
-      const latest = await upstashGet(`last:${testSymbol}`);
-      if (!latest) return res.status(200).json({ ok: false, note: `No data for last:${testSymbol}` });
+      let state = null;
+
+      if (datasetKey) {
+        const atMs = parseAtMsFromQuery(req);
+        if (!atMs) return res.status(200).json({ ok: false, note: "Missing/invalid at or at_ms for dataset test" });
+
+        const dataset = await upstashGet(datasetKey);
+        if (!dataset) return res.status(200).json({ ok: false, note: `No dataset found for ${datasetKey}` });
+
+        state = buildStateFromDataset(dataset, atMs);
+      } else {
+        state = await upstashGet(`last:${testSymbol}`);
+        if (!state) return res.status(200).json({ ok: false, note: `No data for last:${testSymbol}` });
+      }
 
       const prompt = test === "0900" ? build0900Prompt() : build0930Prompt();
-      const answer = await callOpenAI({ prompt, state: latest });
+      const answer = await callOpenAI({ prompt, state });
 
-      const header = test === "0900"
-        ? `*TEST 09:00 – ${testSymbol}*`
-        : `*TEST 09:30 – ${testSymbol}*`;
+      const header = datasetKey
+        ? `*TEST ${test.toUpperCase()} – ${testSymbol}*\n_${datasetKey}_`
+        : `*TEST ${test.toUpperCase()} – ${testSymbol}*`;
 
       await sendTelegramMessage(`${header}\n\n${answer}`);
-
-      return res.status(200).json({ ok: true, test: true, which: test, symbol: testSymbol });
+      return res.status(200).json({ ok: true, test: true, which: test, symbol: testSymbol, dataset: datasetKey || null });
     }
 
-    // Tidsstyring (norsk tid) basert på payload.time_ms (ms)
+    // ─────────────────────────────
+    // Normal scheduler (09:00 / 09:30) based on payload.time_ms
+    // ─────────────────────────────
     const timeMs = payload?.time_ms;
     if (typeof timeMs !== "number") {
       return res.status(200).json({ ok: true, stored: true, key, note: "No time_ms in payload; skipped scheduled alerts." });
@@ -362,11 +501,9 @@ export default async function handler(req, res) {
     const t = getOsloPartsFromMs(timeMs);
     const dateKey = `${t.yyyy}-${String(t.mm).padStart(2, "0")}-${String(t.dd).padStart(2, "0")}`;
 
-    // Trigger kun på 09:00 og 09:30 (Oslo)
     const is0900 = (t.hh === 9 && t.min === 0);
     const is0930 = (t.hh === 9 && t.min === 30);
 
-    // Anti-dupe (per dag)
     if (is0900 || is0930) {
       const sentKey = `sent:${symbol}:${dateKey}:${is0900 ? "0900" : "0930"}`;
       const already = await upstashGet(sentKey);
@@ -376,11 +513,8 @@ export default async function handler(req, res) {
         const answer = await callOpenAI({ prompt, state: payload });
 
         const header = is0900 ? `*09:00 London-forberedelse – ${symbol}*` : `*09:30 London update – ${symbol}*`;
-        const msg = `${header}\n\n${answer}`;
+        await sendTelegramMessage(`${header}\n\n${answer}`);
 
-        await sendTelegramMessage(msg);
-
-        // Marker som sendt (TTL 48t)
         await upstashSet(sentKey, { sent: true, at_ms: timeMs }, 172800);
       }
     }
