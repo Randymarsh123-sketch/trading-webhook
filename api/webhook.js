@@ -3,11 +3,10 @@
 // Sends 09:00 and 09:30 Telegram alerts (Europe/Oslo)
 //
 // TESTING (after deploy):
-//  - Live latest (uses last:SYMBOL):
-//      POST /api/webhook?test=0930&symbol=EURUSD
-//  - Sandbox dataset (uses dataset key + time):
+//  - Sandbox dataset (recommended: use at_ms):
 //      POST /api/webhook?test=0930&dataset=dataset:EURUSD:5d&at_ms=1734337800000
-//      (recommended: always use at_ms to avoid URL timezone parsing issues)
+//  - Live latest:
+//      POST /api/webhook?test=0930&symbol=EURUSD
 
 async function upstashSet(key, valueObj, ttlSeconds = 172800) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -21,13 +20,11 @@ async function upstashSet(key, valueObj, ttlSeconds = 172800) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    // Upstash REST /set takes JSON body as the value
     body: JSON.stringify(valueObj),
   });
 
   if (!resp.ok) throw new Error(`Upstash SET failed: ${resp.status} ${await resp.text()}`);
 
-  // TTL (expire)
   const exp = await fetch(`${url}/expire/${encodeURIComponent(key)}/${ttlSeconds}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
@@ -46,23 +43,26 @@ async function upstashGet(key) {
   });
 
   if (!resp.ok) throw new Error(`Upstash GET failed: ${resp.status} ${await resp.text()}`);
-  const data = await resp.json(); // { result: ... }
-  const result = data?.result ?? null;
+  const data = await resp.json();
+  let result = data?.result ?? null;
 
-  // IMPORTANT: Upstash REST often returns stored JSON as a STRING.
-  // Make it robust: parse JSON strings automatically.
-  if (typeof result === "string") {
+  // Upstash REST can return JSON as a string (sometimes even double-encoded).
+  // Parse up to 2 times if needed.
+  for (let i = 0; i < 2; i++) {
+    if (typeof result !== "string") break;
     const s = result.trim();
     if (
       (s.startsWith("{") && s.endsWith("}")) ||
-      (s.startsWith("[") && s.endsWith("]"))
+      (s.startsWith("[") && s.endsWith("]")) ||
+      (s.startsWith('"') && s.endsWith('"'))
     ) {
       try {
-        return JSON.parse(s);
+        result = JSON.parse(s);
       } catch {
-        // if parsing fails, return raw string
-        return result;
+        break;
       }
+    } else {
+      break;
     }
   }
 
@@ -89,7 +89,6 @@ async function sendTelegramMessage(text) {
 }
 
 function getOsloPartsFromMs(ms) {
-  // Returns { yyyy, mm, dd, hh, min } in Europe/Oslo
   const dtf = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Europe/Oslo",
     year: "numeric",
@@ -114,14 +113,12 @@ function getOsloPartsFromMs(ms) {
 }
 
 function parseAtMsFromQuery(req) {
-  // Prefer at_ms (most robust)
   const atMsRaw = req.query?.at_ms;
   if (atMsRaw !== undefined) {
     const n = Number(atMsRaw);
     if (Number.isFinite(n) && n > 0) return Math.trunc(n);
   }
 
-  // Alternative: at=ISO-8601 (but can be tricky due to URL encoding of '+')
   const at = String(req.query?.at || "").trim();
   if (!at) return null;
 
@@ -132,8 +129,9 @@ function parseAtMsFromQuery(req) {
 }
 
 function findLastCandleAtOrBefore(arr, atMs) {
-  // arr sorted oldest->newest, items: {ts,o,h,l,c,v}
-  let lo = 0, hi = arr.length - 1, ans = -1;
+  let lo = 0,
+    hi = arr.length - 1,
+    ans = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     const t = Number(arr[mid]?.ts);
@@ -176,9 +174,11 @@ function minLow(arr) {
 
 function buildStateFromDataset(dataset, atMs) {
   const symbol = dataset?.meta?.symbol || "EURUSD";
-  const m5 = dataset?.m5 || [];
-  const h1 = dataset?.h1 || [];
-  const d1 = dataset?.d1 || [];
+
+  // Accept both key names, just in case: m5 or m5[]
+  const m5 = dataset?.m5 || dataset?.m5_candles || dataset?.m5Candles || [];
+  const h1 = dataset?.h1 || dataset?.h1_candles || dataset?.h1Candles || [];
+  const d1 = dataset?.d1 || dataset?.d1_candles || dataset?.d1Candles || [];
 
   if (!Array.isArray(m5) || m5.length === 0) throw new Error("Dataset missing m5[]");
   if (!Array.isArray(h1) || h1.length === 0) throw new Error("Dataset missing h1[]");
@@ -189,27 +189,24 @@ function buildStateFromDataset(dataset, atMs) {
   const last5 = m5[idx5];
 
   const t = getOsloPartsFromMs(atMs);
-  const yyyy = t.yyyy;
-  const mm = t.mm;
-  const dd = t.dd;
+  const yyyy = t.yyyy,
+    mm = t.mm,
+    dd = t.dd;
 
-  // All m5 candles for this Oslo day
   const m5SameDay = [];
   for (const c of m5) {
     const p = getOsloPartsFromMs(c.ts);
     if (p.yyyy === yyyy && p.mm === mm && p.dd === dd) m5SameDay.push(c);
   }
 
-  // Asia: 02:00–06:59
   const asiaCandles = m5SameDay.filter((c) => {
     const p = getOsloPartsFromMs(c.ts);
-    return p.hh >= 2 && p.hh <= 6;
+    return p.hh >= 2 && p.hh <= 6; // 02:00–06:59
   });
 
-  // Frankfurt: 08:00–08:59
   const frCandles = m5SameDay.filter((c) => {
     const p = getOsloPartsFromMs(c.ts);
-    return p.hh === 8;
+    return p.hh === 8; // 08:00–08:59
   });
 
   const asiaHigh = asiaCandles.length ? maxHigh(asiaCandles) : null;
@@ -234,7 +231,6 @@ function buildStateFromDataset(dataset, atMs) {
     frankfurt_low: frankfurtLow,
     in_london_window: londonWindow,
     htf_data: {
-      // Your new model uses Daily + 1H + 5m; keep m15 empty for now.
       m15: [],
       h1: sliceCandlesUpTo(h1, atMs, 72).map((x) => ({
         timestamp: Number(x.ts),
@@ -257,7 +253,6 @@ function buildStateFromDataset(dataset, atMs) {
 }
 
 // ===== PROMPTS =====
-// Keep these as-is for now; you can tweak wording later.
 function build0900Prompt() {
   return `ALERT 09:00 (Europe/Oslo) – EURUSD Early-Cycle Context
 
@@ -472,15 +467,14 @@ ${JSON.stringify(state).slice(0, 240000)}`;
 
 export default async function handler(req, res) {
   try {
-    // Alive check
     if (req.method === "GET") return res.status(200).json({ ok: true, message: "webhook alive" });
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-    // Always store incoming TradingView payload (normal mode)
     const payload = req.body || {};
     const symbol = payload?.symbol || "unknown";
     const key = `last:${symbol}`;
 
+    // Always store incoming TradingView payload (normal mode)
     await upstashSet(key, payload, 172800);
     await upstashSet("latest:any", payload, 172800);
 
@@ -523,9 +517,7 @@ export default async function handler(req, res) {
     // ─────────────────────────────
     const timeMs = payload?.time_ms;
     if (typeof timeMs !== "number") {
-      return res
-        .status(200)
-        .json({ ok: true, stored: true, key, note: "No time_ms in payload; skipped scheduled alerts." });
+      return res.status(200).json({ ok: true, stored: true, key, note: "No time_ms in payload; skipped scheduled alerts." });
     }
 
     const t = getOsloPartsFromMs(timeMs);
@@ -542,10 +534,7 @@ export default async function handler(req, res) {
         const prompt = is0900 ? build0900Prompt() : build0930Prompt();
         const answer = await callOpenAI({ prompt, state: payload });
 
-        const header = is0900
-          ? `*09:00 London-forberedelse – ${symbol}*`
-          : `*09:30 London update – ${symbol}*`;
-
+        const header = is0900 ? `*09:00 London-forberedelse – ${symbol}*` : `*09:30 London update – ${symbol}*`;
         await sendTelegramMessage(`${header}\n\n${answer}`);
 
         await upstashSet(sentKey, { sent: true, at_ms: timeMs }, 172800);
