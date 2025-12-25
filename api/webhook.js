@@ -2,11 +2,12 @@
 // Stores TradingView payload in Upstash (last:SYMBOL + latest:any)
 // Sends 09:00 and 09:30 Telegram alerts (Europe/Oslo)
 //
-// TESTING (after deploy):
-//  - Sandbox dataset (recommended: use at_ms):
-//      POST /api/webhook?test=0930&dataset=dataset:EURUSD:5d&at_ms=1734337800000
-//  - Live latest:
-//      POST /api/webhook?test=0930&symbol=EURUSD
+// TEST (recommended):
+//   POST /api/webhook?test=0930&dataset=dataset:EURUSD:5d&at_ms=1734337800000
+//
+// INSPECT dataset shape (VERY IMPORTANT DEBUG):
+//   GET  /api/webhook?inspect=1&dataset=dataset:EURUSD:5d
+// This returns keys + where m5/h1/d1 were found.
 
 async function upstashSet(key, valueObj, ttlSeconds = 172800) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -46,9 +47,9 @@ async function upstashGet(key) {
   const data = await resp.json();
   let result = data?.result ?? null;
 
-  // Upstash REST can return JSON as a string (sometimes even double-encoded).
-  // Parse up to 2 times if needed.
-  for (let i = 0; i < 2; i++) {
+  // Upstash REST can return JSON as a string (sometimes double-encoded).
+  // Parse up to 3 times just in case.
+  for (let i = 0; i < 3; i++) {
     if (typeof result !== "string") break;
     const s = result.trim();
     if (
@@ -134,8 +135,8 @@ function findLastCandleAtOrBefore(arr, atMs) {
     ans = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    const t = Number(arr[mid]?.ts);
-    if (t <= atMs) {
+    const t = Number(arr[mid]?.ts ?? arr[mid]?.timestamp ?? arr[mid]?.time_ms ?? arr[mid]?.time);
+    if (Number.isFinite(t) && t <= atMs) {
       ans = mid;
       lo = mid + 1;
     } else {
@@ -155,7 +156,7 @@ function sliceCandlesUpTo(arr, atMs, count) {
 function maxHigh(arr) {
   let m = null;
   for (const x of arr) {
-    const h = Number(x?.h);
+    const h = Number(x?.h ?? x?.high);
     if (!Number.isFinite(h)) continue;
     if (m === null || h > m) m = h;
   }
@@ -165,24 +166,135 @@ function maxHigh(arr) {
 function minLow(arr) {
   let m = null;
   for (const x of arr) {
-    const l = Number(x?.l);
+    const l = Number(x?.l ?? x?.low);
     if (!Number.isFinite(l)) continue;
     if (m === null || l < m) m = l;
   }
   return m;
 }
 
+// ---- Robust dataset extractors ----
+
+function normalizeTopKeys(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  const out = { ...obj };
+  // also map uppercase keys to lowercase if needed
+  for (const k of Object.keys(obj)) {
+    const lk = String(k).toLowerCase();
+    if (!(lk in out)) out[lk] = obj[k];
+  }
+  return out;
+}
+
+function tryGetCandlesFrom(obj, keyCandidates) {
+  if (!obj || typeof obj !== "object") return null;
+  const o = normalizeTopKeys(obj);
+
+  for (const k of keyCandidates) {
+    if (Array.isArray(o[k])) return { arr: o[k], path: k };
+  }
+  return null;
+}
+
+function pickDatasetCandles(dataset) {
+  // Most common places
+  const candidatesM5 = ["m5", "m5candles", "m5_candles", "candles_m5", "m5data", "m5_data"];
+  const candidatesH1 = ["h1", "h1candles", "h1_candles", "candles_h1", "h1data", "h1_data", "h60", "m60", "hourly"];
+  const candidatesD1 = ["d1", "d1candles", "d1_candles", "candles_d1", "d1data", "d1_data", "daily", "d"];
+
+  // try top-level
+  let m5 = tryGetCandlesFrom(dataset, candidatesM5);
+  let h1 = tryGetCandlesFrom(dataset, candidatesH1);
+  let d1 = tryGetCandlesFrom(dataset, candidatesD1);
+
+  // try common nested keys
+  const nestedKeys = ["data", "dataset", "payload", "store", "candles", "series"];
+  if (!m5 || !h1 || !d1) {
+    for (const nk of nestedKeys) {
+      const nested = dataset?.[nk] ?? dataset?.[nk?.toUpperCase?.()];
+      if (!nested || typeof nested !== "object") continue;
+      m5 = m5 || tryGetCandlesFrom(nested, candidatesM5)?.arr ? { arr: nested?.m5 ?? nested?.M5 ?? nested?.m5candles ?? nested?.m5_candles, path: `${nk}.m5*` } : m5;
+      h1 = h1 || tryGetCandlesFrom(nested, candidatesH1)?.arr ? { arr: nested?.h1 ?? nested?.H1 ?? nested?.h60 ?? nested?.m60 ?? nested?.hourly, path: `${nk}.h1*` } : h1;
+      d1 = d1 || tryGetCandlesFrom(nested, candidatesD1)?.arr ? { arr: nested?.d1 ?? nested?.D1 ?? nested?.daily ?? nested?.d, path: `${nk}.d1*` } : d1;
+
+      // fallback: use robust search
+      if (!m5) m5 = tryGetCandlesFrom(nested, candidatesM5);
+      if (!h1) h1 = tryGetCandlesFrom(nested, candidatesH1);
+      if (!d1) d1 = tryGetCandlesFrom(nested, candidatesD1);
+    }
+  }
+
+  // final fallback: deep search (limited)
+  function deepFindArray(obj, wants) {
+    const seen = new Set();
+    const stack = [{ v: obj, p: "" }];
+    while (stack.length) {
+      const { v, p } = stack.pop();
+      if (!v || typeof v !== "object") continue;
+      if (seen.has(v)) continue;
+      seen.add(v);
+
+      const norm = normalizeTopKeys(v);
+      const hit = tryGetCandlesFrom(norm, wants);
+      if (hit) return { arr: hit.arr, path: p ? `${p}.${hit.path}` : hit.path };
+
+      for (const k of Object.keys(norm)) {
+        const child = norm[k];
+        if (child && typeof child === "object") stack.push({ v: child, p: p ? `${p}.${k}` : k });
+      }
+    }
+    return null;
+  }
+
+  if (!m5) m5 = deepFindArray(dataset, candidatesM5);
+  if (!h1) h1 = deepFindArray(dataset, candidatesH1);
+  if (!d1) d1 = deepFindArray(dataset, candidatesD1);
+
+  return {
+    m5,
+    h1,
+    d1,
+  };
+}
+
+function toStdCandle(x) {
+  // Accept both formats:
+  //  - {ts,o,h,l,c,v}
+  //  - {timestamp,open,high,low,close,volume}
+  const ts = Number(x?.ts ?? x?.timestamp ?? x?.time_ms ?? x?.time);
+  const o = Number(x?.o ?? x?.open);
+  const h = Number(x?.h ?? x?.high);
+  const l = Number(x?.l ?? x?.low);
+  const c = Number(x?.c ?? x?.close);
+  const v = Number(x?.v ?? x?.volume ?? 0);
+  return { ts, o, h, l, c, v };
+}
+
 function buildStateFromDataset(dataset, atMs) {
-  const symbol = dataset?.meta?.symbol || "EURUSD";
+  const symbol = dataset?.meta?.symbol || dataset?.symbol || "EURUSD";
 
-  // Accept both key names, just in case: m5 or m5[]
-  const m5 = dataset?.m5 || dataset?.m5_candles || dataset?.m5Candles || [];
-  const h1 = dataset?.h1 || dataset?.h1_candles || dataset?.h1Candles || [];
-  const d1 = dataset?.d1 || dataset?.d1_candles || dataset?.d1Candles || [];
+  const picked = pickDatasetCandles(dataset);
 
-  if (!Array.isArray(m5) || m5.length === 0) throw new Error("Dataset missing m5[]");
-  if (!Array.isArray(h1) || h1.length === 0) throw new Error("Dataset missing h1[]");
-  if (!Array.isArray(d1) || d1.length === 0) throw new Error("Dataset missing d1[]");
+  const m5Info = picked.m5;
+  const h1Info = picked.h1;
+  const d1Info = picked.d1;
+
+  const m5Raw = m5Info?.arr;
+  const h1Raw = h1Info?.arr;
+  const d1Raw = d1Info?.arr;
+
+  if (!Array.isArray(m5Raw) || m5Raw.length === 0) throw new Error("Dataset missing m5[]");
+  if (!Array.isArray(h1Raw) || h1Raw.length === 0) throw new Error("Dataset missing h1[]");
+  if (!Array.isArray(d1Raw) || d1Raw.length === 0) throw new Error("Dataset missing d1[]");
+
+  // normalize candle objects
+  const m5 = m5Raw.map(toStdCandle).filter((x) => Number.isFinite(x.ts));
+  const h1 = h1Raw.map(toStdCandle).filter((x) => Number.isFinite(x.ts));
+  const d1 = d1Raw.map(toStdCandle).filter((x) => Number.isFinite(x.ts));
+
+  if (!m5.length) throw new Error("Dataset m5[] exists but timestamps are missing/invalid");
+  if (!h1.length) throw new Error("Dataset h1[] exists but timestamps are missing/invalid");
+  if (!d1.length) throw new Error("Dataset d1[] exists but timestamps are missing/invalid");
 
   const idx5 = findLastCandleAtOrBefore(m5, atMs);
   if (idx5 < 0) throw new Error("No m5 candle at/before atMs in dataset");
@@ -193,20 +305,23 @@ function buildStateFromDataset(dataset, atMs) {
     mm = t.mm,
     dd = t.dd;
 
+  // All m5 candles for this Oslo day
   const m5SameDay = [];
   for (const c of m5) {
     const p = getOsloPartsFromMs(c.ts);
     if (p.yyyy === yyyy && p.mm === mm && p.dd === dd) m5SameDay.push(c);
   }
 
+  // Asia: 02:00–06:59
   const asiaCandles = m5SameDay.filter((c) => {
     const p = getOsloPartsFromMs(c.ts);
-    return p.hh >= 2 && p.hh <= 6; // 02:00–06:59
+    return p.hh >= 2 && p.hh <= 6;
   });
 
+  // Frankfurt: 08:00–08:59
   const frCandles = m5SameDay.filter((c) => {
     const p = getOsloPartsFromMs(c.ts);
-    return p.hh === 8; // 08:00–08:59
+    return p.hh === 8;
   });
 
   const asiaHigh = asiaCandles.length ? maxHigh(asiaCandles) : null;
@@ -262,8 +377,11 @@ Day:
 Time:
 
 Daily Cycle bias: Based on Daily
+
 Asia: Classification of Asia
+
 FVG: Near 1H / Daily FVG above/below Asia that can act as a magnet?
+
 Frankfurt:
 Manipulation yes/no?
 Sweep yes/no?
@@ -271,72 +389,7 @@ BOS up/down yes/no?
 
 London:
 If London has not started:
-What is most likely scenario when it comes to Daily cycle? Judas Swing / Asian Break and Retest / Asian Whipsaw / Dead Frankfurt?
-
-RULES / MODEL (use only candles up to 09:00):
-1) DAILY SCORE + BASE DAILY BIAS (ONLY D-1 and D-2 from d1):
-- range = high(D-1) - low(D-1)
-- close_position = (close(D-1) - low(D-1)) / range
-- inside day if high(D-1) <= high(D-2) AND low(D-1) >= low(D-2)
-- overlap regime: if D-1 and D-2 overlap heavily (~70%+). If you can't quantify overlap exactly from the numbers quickly, label it as "possible overlap" only when it is clearly large; otherwise "no clear overlap".
-
-Score 3:
-- close_position >= 0.60 OR <= 0.40
-- NOT inside day
-- NOT clear overlap regime
-
-Score 2:
-- close_position in [0.55, 0.60) OR (0.40, 0.45]
-- OR close_position is strong but inside/overlap exists
-
-Score 1:
-- close_position near middle (around 0.45–0.55) OR clear chop/overlap
-=> Score 1 means NO TRADE today.
-
-2) BASE DAILY BIAS (before intraday):
-- close_position >= 0.60 => Bullish
-- close_position <= 0.40 => Bearish
-- else => Ranging/Unclear
-
-3) ASIA REFINEMENT of bias (only if score != 1):
-- If Asia Low was taken first (wick touches/breaks Asia Low) => bias leans Bullish
-- If Asia High was taken first => bias leans Bearish
-- If neither side taken => keep base bias
-- If BOTH Asia sides taken (any time up to 09:00) => bias = Ranging AND NO TRADE
-
-4) NO-TRADE extra filter (only if you have data to evaluate 07:00–09:00):
-- If BOTH Asia High and Asia Low have been taken between 07:00 and 10:00 => NO TRADE.
-At 09:00 you can only state: "so far (07:00–09:00) both taken: yes/no/unknown".
-
-5) FVG expectation layer (ONLY if ALL true):
-- Score is 2 or 3
-- Daily bias defined
-- Asia range established
-- There exists an unmitigated Daily or 1H FVG
-- FVG is OUTSIDE Asia range
-- FVG is in OPPOSITE direction of daily bias
-If any condition missing => write "FVG: none / not active".
-
-If active:
-- Bullish daily bias + FVG above Asia => neutral expectation: price may move up first to rebalance, then later resume bullish
-- Bearish daily bias + FVG below Asia => neutral expectation: price may move down first to rebalance, then later resume bearish
-Never say "must fill". No price targets.
-
-6) DAILY CYCLE REGIME (09:00 provisional):
-Classify most likely regime, but note that Asian Whipsaw final confirmation is at 10:00.
-Regime engine order:
-A) Asian Whipsaw = both Asia High AND Asia Low taken with wick before 10:00 (at 09:00: can only say "so far yes/no")
-B) Asia Break-And-Retest = before 09:30: at least one 5m CLOSE outside Asia High/Low + acceptance (two closes outside OR one clear close without immediate return)
-C) Judas Swing eligibility gate = at least one Asia side taken before 09:30 (at 09:00: "eligible so far yes/no")
-D) Dead-Frankfurt otherwise
-
-At 09:00, London has not started. Do NOT invent BOS/CHOCH. Only mark "unknown / not applicable yet" if needed.
-
-Also:
-- Asia session is 02:00–06:59.
-- Frankfurt session is 08:00–08:59.
-- London early is 09:00–09:29 (not started yet at 09:00 close).
-Keep it concise.`;
+What is most likely scenario when it comes to Daily cycle? Judas Swing / Asian Break and Retest / Asian Whipsaw / Dead Frankfurt?`;
 }
 
 function build0930Prompt() {
@@ -348,7 +401,9 @@ Day:
 Time:
 
 Daily Cycle bias: Based on Daily
+
 Asia: Classification of Asia
+
 FVG: Near 1H / Daily FVG above/below Asia that can act as a magnet?
 
 Frankfurt:
@@ -362,53 +417,10 @@ Sweep yes/no?
 BOS up/down yes/no?
 
 What is most likely scenario when it comes to Daily cycle? Judas Swing / Asian Break and Retest / Asian Whipsaw / Dead Frankfurt?
+
 What does London need to do?
 For example IF it does this, confirmation of THAT (daily cycle / bearish / bullish)
-For example IF it does this, look out for THIS (daily cycle / bearish / bullish)
-
-RULES / MODEL (use only candles up to 09:30):
-- Apply the exact same DAILY score/bias rules as 09:00 (D-1, D-2 only).
-- If Score 1 => NO TRADE: still fill the template, but "What does London need to do?" must say: "No trade day (Score 1) – ignore early-cycle signals."
-
-ASIA REFINEMENT at 09:30:
-- If BOTH Asia sides have been taken by 09:30 => bias = Ranging AND NO TRADE.
-
-NO-TRADE early-cycle filter:
-- If BOTH Asia High and Asia Low have been taken between 07:00 and 10:00:
-At 09:30 state "so far (07:00–09:30) both taken: yes/no/unknown". If yes => NO TRADE.
-
-DAILY CYCLE REGIME engine (deterministic order):
-1) Asian Whipsaw:
-- If both Asia High and Asia Low are taken with wick before 10:00.
-At 09:30: if both already taken => "Asian Whipsaw (provisional; final at 10:00)".
-2) Asia Break-And-Retest:
-- BEFORE 09:30: at least one 5m candle CLOSE outside Asia High/Low.
-- Acceptance requires: (two closes outside) OR (one clear close without immediate return inside).
-If this is true => classify as "Asia Break-And-Retest (expect retest in London main)".
-Do NOT claim retest happened unless it already did.
-3) Judas Swing:
-Eligibility gate: at least one Asia side taken before 09:30.
-Judas definition requires: only one Asia side taken before 09:30, and the opposite Asia side taken later before 14:00, and day is NOT whipsaw.
-At 09:30 you cannot confirm the later opposite-side-take; you must phrase as:
-- "Judas Swing (eligible / watch for opposite Asia side later)" only if eligible conditions match.
-4) Dead-Frankfurt:
-- If no acceptance-break before 09:30, and not whipsaw, and no Judas eligibility context, then "Dead-Frankfurt" (low early-cycle info; wait for first acceptance-break after 09:30).
-- If you are unsure, choose Dead-Frankfurt and say "no acceptance-break confirmed".
-
-FVG layer (same activation rules as 09:00). If not all conditions met => "FVG: none / not active".
-
-Definitions you MUST respect:
-- "Sweep / taken" = wick beyond Asia/Frankfurt levels is enough.
-- "Break / acceptance" = CLOSE beyond Asia High/Low (wick alone doesn't count).
-- BOS up/down: only say YES if you can point to a clear break of a prior swing structure from the provided candles; otherwise "unknown" or "not confirmed".
-
-"What does London need to do?" must be a practical gate:
-- If Break-And-Retest regime: London main should show retest of the broken Asia boundary (High/Low/Mid) before continuation is considered.
-- If Dead-Frankfurt: wait for first acceptance-break after 09:30; ignore wicks outside Asia in London early.
-- If Whipsaw provisional: quality low; prefer waiting toward 10:00 for clarity.
-- If Judas eligible: watch for the opposite Asia side to be taken later (before 14:00); until then treat early moves as rebalancing-risk, not trend.
-
-Keep it short.`;
+For example IF it does this, look out for THIS (daily cycle / bearish / bullish)`;
 }
 
 async function callOpenAI({ prompt, state }) {
@@ -426,10 +438,10 @@ KRITISK:
 - Tidssone: Europe/Oslo.
 
 DATA:
-- 5m live candle: state.open/high/low/close/time_ms
+- 5m: state.open/high/low/close/time_ms
 - Asia/Frankfurt: state.asia_high/asia_low/frankfurt_high/frankfurt_low
 - HTF: state.htf_data.h1 (1H), state.htf_data.d1 (Daily)
-- Daily (d1): nyeste candle kan være pågående. For D-1/D-2: bruk de to siste LUKKEDE daily candles.
+- Daily (d1): bruk de to siste LUKKEDE daily candles for D-1/D-2 hvis mulig.
 
 WICK vs CLOSE:
 - "taken/sweep" = wick beyond level is enough
@@ -467,14 +479,41 @@ ${JSON.stringify(state).slice(0, 240000)}`;
 
 export default async function handler(req, res) {
   try {
-    if (req.method === "GET") return res.status(200).json({ ok: true, message: "webhook alive" });
+    // --- Inspect dataset (debug) ---
+    // GET /api/webhook?inspect=1&dataset=dataset:EURUSD:5d
+    if (req.method === "GET") {
+      const inspect = String(req.query?.inspect || "") === "1";
+      const datasetKey = String(req.query?.dataset || "").trim();
+      if (inspect && datasetKey) {
+        const dataset = await upstashGet(datasetKey);
+        const picked = pickDatasetCandles(dataset);
+
+        return res.status(200).json({
+          ok: true,
+          inspect: true,
+          dataset_key: datasetKey,
+          top_keys: dataset && typeof dataset === "object" ? Object.keys(dataset).slice(0, 200) : null,
+          found: {
+            m5_path: picked?.m5?.path || null,
+            h1_path: picked?.h1?.path || null,
+            d1_path: picked?.d1?.path || null,
+            m5_len: Array.isArray(picked?.m5?.arr) ? picked.m5.arr.length : 0,
+            h1_len: Array.isArray(picked?.h1?.arr) ? picked.h1.arr.length : 0,
+            d1_len: Array.isArray(picked?.d1?.arr) ? picked.d1.arr.length : 0,
+          },
+        });
+      }
+
+      return res.status(200).json({ ok: true, message: "webhook alive" });
+    }
+
     if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
+    // Always store incoming TradingView payload (normal mode)
     const payload = req.body || {};
     const symbol = payload?.symbol || "unknown";
     const key = `last:${symbol}`;
 
-    // Always store incoming TradingView payload (normal mode)
     await upstashSet(key, payload, 172800);
     await upstashSet("latest:any", payload, 172800);
 
