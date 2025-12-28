@@ -52,9 +52,16 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     body: JSON.stringify({
       model,
       instructions,
+
+      // Use a plain string input
       input,
-      text: { verbosity: "low" },
-      max_output_tokens: 1200,
+
+      // Key fix: control reasoning and allow enough total output tokens
+      reasoning: { effort: "low", summary: "auto" },
+
+      // IMPORTANT: this is total output tokens (reasoning + final text)
+      max_output_tokens: 5000,
+
       store: false,
     }),
   });
@@ -64,12 +71,12 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     throw new Error("OpenAI error: " + JSON.stringify(data));
   }
 
-  // Preferer output_text hvis den finnes
+  // If OpenAI provided helper output_text, use it
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // Fallback: forsøk å finne tekst i output-arrayet
+  // Fallback: try to find text in output items
   if (Array.isArray(data.output)) {
     for (const item of data.output) {
       if (item && item.type === "message" && Array.isArray(item.content)) {
@@ -81,7 +88,7 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     }
   }
 
-  // Siste utvei: returner hele JSON (debug)
+  // Last resort: return full JSON so we can debug
   return JSON.stringify(data);
 }
 
