@@ -16,10 +16,14 @@ async function fetchCandles(interval, outputsize) {
   const data = await res.json();
 
   if (!data.values) {
-    throw new Error("No data returned from TwelveData");
+    // Vis ekte svar fra TwelveData så vi kan fikse riktig
+    throw new Error(
+      "TwelveData response: " + JSON.stringify(data)
+    );
   }
 
   return data.values.reverse();
+
 }
 
 module.exports = async (req, res) => {
