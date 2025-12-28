@@ -1,5 +1,8 @@
 const { Redis } = require("@upstash/redis");
 
+const basicBlock = require("../analysis/basic");
+const dailyBiasBlock = require("../analysis/del1_dailyBias");
+
 const redis = new Redis({
   url: process.env.KV_REST_API_URL,
   token: process.env.KV_REST_API_TOKEN,
@@ -26,33 +29,21 @@ async function fetchCandles(interval, outputsize, apiKey) {
     throw new Error("TwelveData response: " + JSON.stringify(data));
   }
 
-  // TwelveData returns newest->oldest. We want oldest->newest.
-  return data.values.reverse();
+  return data.values.reverse(); // oldest -> newest
 }
 
 function mergeByDatetime(existing, incoming) {
   const map = new Map();
-  for (const c of Array.isArray(existing) ? existing : []) map.set(c.datetime, c);
-  for (const c of Array.isArray(incoming) ? incoming : []) map.set(c.datetime, c);
-
-  return Array.from(map.values()).sort((a, b) => (a.datetime < b.datetime ? -1 : a.datetime > b.datetime ? 1 : 0));
-}
-
-function extractTextFromResponsesApi(resp) {
-  // Newer Responses API often includes output_text
-  if (resp && typeof resp.output_text === "string" && resp.output_text.trim()) return resp.output_text;
-
-  // Fallback: try to find text in output items
-  const out = resp && Array.isArray(resp.output) ? resp.output : [];
-  for (const item of out) {
-    if (item && item.type === "message" && Array.isArray(item.content)) {
-      const texts = item.content
-        .filter((c) => c && (c.type === "output_text" || c.type === "text") && (c.text || c.output_text))
-        .map((c) => c.text || c.output_text);
-      if (texts.length) return texts.join("\n");
-    }
+  for (const c of Array.isArray(existing) ? existing : []) {
+    map.set(c.datetime, c);
   }
-  return JSON.stringify(resp);
+  for (const c of Array.isArray(incoming) ? incoming : []) {
+    map.set(c.datetime, c);
+  }
+
+  return Array.from(map.values()).sort((a, b) =>
+    a.datetime < b.datetime ? -1 : a.datetime > b.datetime ? 1 : 0
+  );
 }
 
 async function callOpenAI({ apiKey, model, instructions, input }) {
@@ -65,8 +56,8 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     body: JSON.stringify({
       model,
       instructions,
-      input, // plain text input is allowed
-      max_output_tokens: 600,
+      input,
+      max_output_tokens: 700,
       store: false,
     }),
   });
@@ -75,69 +66,90 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
   if (!res.ok) {
     throw new Error("OpenAI error: " + JSON.stringify(data));
   }
-  return data;
+
+  if (typeof data.output_text === "string") {
+    return data.output_text;
+  }
+
+  return JSON.stringify(data);
 }
 
 module.exports = async (req, res) => {
   try {
     const tf = (req.query.tf || "5M").toUpperCase();
     const cfg = mapTfToTwelveData(tf);
-    if (!cfg) return res.status(400).json({ error: "tf must be one of: 1D, 1H, 5M" });
+    if (!cfg) {
+      return res.status(400).json({ error: "tf must be one of: 1D, 1H, 5M" });
+    }
 
     const question = (req.query.q || "").trim();
     if (!question) {
       return res.status(400).json({
-        error: "Missing q (question). Example: /api/analyze?tf=5M&q=What%20happened%20at%2009:45%20sweep",
+        error: "Missing q (question). Example: ?q=Daily bias check",
       });
     }
 
     const twelveKey = process.env.TWELVEDATA_API_KEY;
-    if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
-
     const openaiKey = process.env.OPENAI_API_KEY;
-    if (!openaiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY in env" });
+    if (!twelveKey || !openaiKey) {
+      return res.status(500).json({ error: "Missing API keys in env" });
+    }
 
     const model = process.env.OPENAI_MODEL || "gpt-5";
 
-    // 1) Read existing
+    // 1) Read existing candles
     const existing = await redis.get(cfg.key);
 
-    // 2) Fetch latest chunk + merge
+    // 2) Fetch latest candles and merge
     const latest = await fetchCandles(cfg.interval, cfg.fetch, twelveKey);
     const merged = mergeByDatetime(existing, latest);
 
-    // 3) Keep rolling window in Redis
+    // 3) Store rolling window
     const trimmed = merged.slice(Math.max(0, merged.length - cfg.keep));
     await redis.set(cfg.key, trimmed);
 
-    // 4) To keep OpenAI request small: analyze only last N candles
-    // Defaults: 5M=300 (25 hours), 1H=200 (~8 days), 1D=60 (~60 days)
+    // 4) Limit candles sent to model
     const defaultN = tf === "5M" ? 300 : tf === "1H" ? 200 : 60;
-    const n = Math.max(20, Math.min(parseInt(req.query.n || String(defaultN), 10), trimmed.length));
-    const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - n));
+    const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - defaultN));
 
-    const lastDatetime = candlesForModel.length ? candlesForModel[candlesForModel.length - 1].datetime : null;
+    const lastDatetime =
+      candlesForModel.length > 0
+        ? candlesForModel[candlesForModel.length - 1].datetime
+        : null;
+
+    // 5) Build modular prompt
+    const basic = basicBlock();
+    const del1 = dailyBiasBlock();
 
     const instructions =
-      "You are an FX market-structure analyst (SMC style). " +
-      "Use only the candles provided. Be concrete, short, and specific. " +
-      "If the question asks about a specific time (like 09:45), focus on the candles around that time. " +
-      "Return: (1) what likely swept liquidity, (2) whether it looks like manipulation/displacement, (3) what to watch next.";
+      "You are an FX market-structure analysis engine. " +
+      "Follow the rules exactly. Do not add assumptions.";
 
     const input =
-      `SYMBOL: EURUSD\nTIMEFRAME: ${tf}\nLAST_DATETIME: ${lastDatetime}\n` +
-      `CANDLES (oldest->newest, JSON):\n${JSON.stringify(candlesForModel)}\n\n` +
+      `${basic}\n\n` +
+      `OUTPUT FORMAT (MANDATORY)\n` +
+      `Basic\n` +
+      `Date / Time (Europe/Oslo)\n\n` +
+      `Del 1 – Daily Bias\n\n` +
+      `${del1}\n\n` +
+      `DATA (JSON, oldest -> newest)\n` +
+      `SYMBOL: EURUSD\n` +
+      `TIMEFRAME: ${tf}\n` +
+      `LAST_DATETIME: ${lastDatetime}\n\n` +
+      `${JSON.stringify(candlesForModel)}\n\n` +
       `QUESTION:\n${question}\n`;
 
-    // 5) Ask OpenAI
-    const resp = await callOpenAI({ apiKey: openaiKey, model, instructions, input });
-    const answer = extractTextFromResponsesApi(resp);
+    // 6) Call OpenAI
+    const answer = await callOpenAI({
+      apiKey: openaiKey,
+      model,
+      instructions,
+      input,
+    });
 
     res.status(200).json({
       ok: true,
       tf,
-      key: cfg.key,
-      candlesUsed: candlesForModel.length,
       lastDatetime,
       answer,
     });
