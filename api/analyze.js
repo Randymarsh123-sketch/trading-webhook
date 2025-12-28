@@ -53,7 +53,8 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
       model,
       instructions,
       input,
-      max_output_tokens: 700,
+      text: { verbosity: "low" },
+      max_output_tokens: 1200,
       store: false,
     }),
   });
@@ -63,10 +64,24 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     throw new Error("OpenAI error: " + JSON.stringify(data));
   }
 
-  if (typeof data.output_text === "string") {
-    return data.output_text;
+  // Preferer output_text hvis den finnes
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
   }
 
+  // Fallback: forsøk å finne tekst i output-arrayet
+  if (Array.isArray(data.output)) {
+    for (const item of data.output) {
+      if (item && item.type === "message" && Array.isArray(item.content)) {
+        const parts = item.content
+          .map((c) => (c && (c.text || c.output_text)) || "")
+          .filter(Boolean);
+        if (parts.length) return parts.join("\n").trim();
+      }
+    }
+  }
+
+  // Siste utvei: returner hele JSON (debug)
   return JSON.stringify(data);
 }
 
@@ -77,25 +92,26 @@ module.exports = async (req, res) => {
     if (!cfg) return res.status(400).json({ error: "tf must be one of: 1D, 1H, 5M" });
 
     const question = (req.query.q || "").trim();
-    if (!question) {
-      return res.status(400).json({ error: "Missing q parameter" });
-    }
+    if (!question) return res.status(400).json({ error: "Missing q parameter" });
 
     const twelveKey = process.env.TWELVEDATA_API_KEY;
     const openaiKey = process.env.OPENAI_API_KEY;
-    if (!twelveKey || !openaiKey) {
-      return res.status(500).json({ error: "Missing API keys" });
-    }
+    if (!twelveKey || !openaiKey) return res.status(500).json({ error: "Missing API keys" });
 
     const model = process.env.OPENAI_MODEL || "gpt-5";
 
+    // 1) Read existing candles
     const existing = await redis.get(cfg.key);
+
+    // 2) Fetch latest candles and merge
     const latest = await fetchCandles(cfg.interval, cfg.fetch, twelveKey);
     const merged = mergeByDatetime(existing, latest);
 
+    // 3) Store rolling window
     const trimmed = merged.slice(Math.max(0, merged.length - cfg.keep));
     await redis.set(cfg.key, trimmed);
 
+    // 4) Limit candles sent to model (keeps cost/latency down)
     const defaultN = tf === "5M" ? 300 : tf === "1H" ? 200 : 60;
     const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - defaultN));
 
@@ -104,25 +120,28 @@ module.exports = async (req, res) => {
         ? candlesForModel[candlesForModel.length - 1].datetime
         : null;
 
+    // 5) Build modular prompt
     const basic = basicBlock();
     const del1 = dailyBiasBlock();
 
     const instructions =
-      "You are an FX market-structure analysis engine. Follow rules strictly.";
+      "You are an FX market-structure analysis engine. Follow rules strictly. Output must follow the required format.";
 
     const input =
       `${basic}\n\n` +
-      `OUTPUT FORMAT\n` +
-      `Basic\nDate / Time (Europe/Oslo)\n\n` +
+      `OUTPUT FORMAT (MANDATORY)\n` +
+      `Basic\n` +
+      `Date / Time (Europe/Oslo)\n\n` +
       `Del 1 – Daily Bias\n\n` +
       `${del1}\n\n` +
-      `DATA (JSON)\n` +
+      `DATA (JSON, oldest -> newest)\n` +
       `SYMBOL: EURUSD\n` +
       `TIMEFRAME: ${tf}\n` +
       `LAST_DATETIME: ${lastDatetime}\n\n` +
       `${JSON.stringify(candlesForModel)}\n\n` +
       `QUESTION:\n${question}\n`;
 
+    // 6) Call OpenAI
     const answer = await callOpenAI({
       apiKey: openaiKey,
       model,
