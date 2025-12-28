@@ -29,7 +29,6 @@ async function fetchCandles(interval, outputsize, apiKey) {
     throw new Error("TwelveData response: " + JSON.stringify(data));
   }
 
-  // TwelveData returns newest->oldest. We want oldest->newest.
   return data.values.reverse();
 }
 
@@ -43,7 +42,6 @@ function mergeByDatetime(existing, incoming) {
   );
 }
 
-// Chat Completions: always returns visible text in choices[0].message.content
 async function callOpenAIChat({ apiKey, model, system, user }) {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -54,7 +52,7 @@ async function callOpenAIChat({ apiKey, model, system, user }) {
     body: JSON.stringify({
       model,
       temperature: 0.2,
-      max_tokens: 900,
+      max_tokens: 700,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
@@ -75,7 +73,7 @@ async function callOpenAIChat({ apiKey, model, system, user }) {
 
 module.exports = async (req, res) => {
   try {
-    const tf = (req.query.tf || "5M").toUpperCase();
+    const tf = (req.query.tf || "1D").toUpperCase();
     const cfg = mapTfToTwelveData(tf);
     if (!cfg) return res.status(400).json({ error: "tf must be one of: 1D, 1H, 5M" });
 
@@ -86,24 +84,15 @@ module.exports = async (req, res) => {
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!twelveKey || !openaiKey) return res.status(500).json({ error: "Missing API keys" });
 
-    // IMPORTANT: Use a model that reliably returns text (no "reasoning-only" output)
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-    // 1) Read existing candles
     const existing = await redis.get(cfg.key);
-
-    // 2) Fetch latest candles and merge
     const latest = await fetchCandles(cfg.interval, cfg.fetch, twelveKey);
     const merged = mergeByDatetime(existing, latest);
 
-    // 3) Store rolling window
     const trimmed = merged.slice(Math.max(0, merged.length - cfg.keep));
     await redis.set(cfg.key, trimmed);
 
-    // 4) Keep input small (THIS matters a lot)
-    // 5M default: last 180 candles (= 15 hours)
-    // 1H default: last 120 candles (= 5 days)
-    // 1D default: last 40 candles
     const defaultN = tf === "5M" ? 180 : tf === "1H" ? 120 : 40;
     const n = Math.max(30, Math.min(parseInt(req.query.n || String(defaultN), 10), trimmed.length));
     const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - n));
@@ -113,28 +102,29 @@ module.exports = async (req, res) => {
         ? candlesForModel[candlesForModel.length - 1].datetime
         : null;
 
-    // 5) Modular prompt blocks
     const basic = basicBlock();
     const del1 = dailyBiasBlock();
 
     const system =
-      "You are an FX market-structure analysis engine. " +
-      "Follow the rules strictly. " +
-      "Output MUST follow the required format. " +
-      "Be short and concrete.";
+      "You are an FX market-structure analysis engine. Follow rules strictly. Output must match the exact template.";
 
     const user =
       `${basic}\n\n` +
-      `OUTPUT FORMAT (MANDATORY)\n` +
+      `OUTPUT TEMPLATE (MUST MATCH EXACTLY)\n` +
       `Basic\n` +
-      `Date / Time (Europe/Oslo)\n\n` +
-      `Del 1 – Daily Bias\n\n` +
-      `${del1}\n\n` +
+      `Date, time: <use LAST_DATETIME>\n\n` +
+      `Del1 - Daily Bias\n` +
+      `<del1 output here>\n\n` +
+      `Del2 - Asia Range\n` +
+      `N/A\n\n` +
+      `Del3 - Daily cycles\n` +
+      `N/A\n\n` +
+      `---\n\n` +
+      `DEL1 RULES:\n${del1}\n\n` +
       `DATA (JSON, oldest -> newest)\n` +
       `SYMBOL: EURUSD\n` +
       `TIMEFRAME: ${tf}\n` +
-      `LAST_DATETIME: ${lastDatetime}\n` +
-      `CANDLES_COUNT: ${candlesForModel.length}\n\n` +
+      `LAST_DATETIME: ${lastDatetime}\n\n` +
       `${JSON.stringify(candlesForModel)}\n\n` +
       `QUESTION:\n${question}\n`;
 
