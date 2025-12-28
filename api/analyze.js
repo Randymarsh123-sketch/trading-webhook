@@ -29,6 +29,7 @@ async function fetchCandles(interval, outputsize, apiKey) {
     throw new Error("TwelveData response: " + JSON.stringify(data));
   }
 
+  // TwelveData returns newest->oldest. We want oldest->newest.
   return data.values.reverse();
 }
 
@@ -42,8 +43,9 @@ function mergeByDatetime(existing, incoming) {
   );
 }
 
-async function callOpenAI({ apiKey, model, instructions, input }) {
-  const res = await fetch("https://api.openai.com/v1/responses", {
+// Chat Completions: always returns visible text in choices[0].message.content
+async function callOpenAIChat({ apiKey, model, system, user }) {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -51,10 +53,12 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     },
     body: JSON.stringify({
       model,
-      instructions,
-      input,
-      max_output_tokens: 1500,
-      store: false,
+      temperature: 0.2,
+      max_tokens: 900,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     }),
   });
 
@@ -63,22 +67,8 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     throw new Error("OpenAI error: " + JSON.stringify(data));
   }
 
-  // Use plain text output
-  if (typeof data.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
-  }
-
-  // Fallback: extract text from output messages
-  if (Array.isArray(data.output)) {
-    for (const item of data.output) {
-      if (item && item.type === "message" && Array.isArray(item.content)) {
-        const parts = item.content
-          .map((c) => (c && (c.text || c.output_text)) || "")
-          .filter(Boolean);
-        if (parts.length) return parts.join("\n").trim();
-      }
-    }
-  }
+  const text = data?.choices?.[0]?.message?.content;
+  if (typeof text === "string" && text.trim()) return text.trim();
 
   return JSON.stringify(data);
 }
@@ -96,53 +86,71 @@ module.exports = async (req, res) => {
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!twelveKey || !openaiKey) return res.status(500).json({ error: "Missing API keys" });
 
-    const model = process.env.OPENAI_MODEL || "gpt-5";
+    // IMPORTANT: Use a model that reliably returns text (no "reasoning-only" output)
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
+    // 1) Read existing candles
     const existing = await redis.get(cfg.key);
+
+    // 2) Fetch latest candles and merge
     const latest = await fetchCandles(cfg.interval, cfg.fetch, twelveKey);
     const merged = mergeByDatetime(existing, latest);
 
+    // 3) Store rolling window
     const trimmed = merged.slice(Math.max(0, merged.length - cfg.keep));
     await redis.set(cfg.key, trimmed);
 
-    const defaultN = tf === "5M" ? 300 : tf === "1H" ? 200 : 60;
-    const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - defaultN));
+    // 4) Keep input small (THIS matters a lot)
+    // 5M default: last 180 candles (= 15 hours)
+    // 1H default: last 120 candles (= 5 days)
+    // 1D default: last 40 candles
+    const defaultN = tf === "5M" ? 180 : tf === "1H" ? 120 : 40;
+    const n = Math.max(30, Math.min(parseInt(req.query.n || String(defaultN), 10), trimmed.length));
+    const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - n));
 
     const lastDatetime =
       candlesForModel.length > 0
         ? candlesForModel[candlesForModel.length - 1].datetime
         : null;
 
+    // 5) Modular prompt blocks
     const basic = basicBlock();
     const del1 = dailyBiasBlock();
 
-    const instructions =
-      "You are an FX market-structure analysis engine. Follow rules strictly. Output must follow the required format.";
+    const system =
+      "You are an FX market-structure analysis engine. " +
+      "Follow the rules strictly. " +
+      "Output MUST follow the required format. " +
+      "Be short and concrete.";
 
-    const input =
+    const user =
       `${basic}\n\n` +
-      `OUTPUT FORMAT\n` +
-      `Basic\nDate / Time (Europe/Oslo)\n\n` +
+      `OUTPUT FORMAT (MANDATORY)\n` +
+      `Basic\n` +
+      `Date / Time (Europe/Oslo)\n\n` +
       `Del 1 – Daily Bias\n\n` +
       `${del1}\n\n` +
-      `DATA (JSON)\n` +
+      `DATA (JSON, oldest -> newest)\n` +
       `SYMBOL: EURUSD\n` +
       `TIMEFRAME: ${tf}\n` +
-      `LAST_DATETIME: ${lastDatetime}\n\n` +
+      `LAST_DATETIME: ${lastDatetime}\n` +
+      `CANDLES_COUNT: ${candlesForModel.length}\n\n` +
       `${JSON.stringify(candlesForModel)}\n\n` +
       `QUESTION:\n${question}\n`;
 
-    const answer = await callOpenAI({
+    const answer = await callOpenAIChat({
       apiKey: openaiKey,
       model,
-      instructions,
-      input,
+      system,
+      user,
     });
 
     res.status(200).json({
       ok: true,
       tf,
       lastDatetime,
+      candlesUsed: candlesForModel.length,
+      model,
       answer,
     });
   } catch (err) {
