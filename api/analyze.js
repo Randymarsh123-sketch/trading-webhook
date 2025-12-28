@@ -29,7 +29,7 @@ async function fetchCandles(interval, outputsize, apiKey) {
     throw new Error("TwelveData response: " + JSON.stringify(data));
   }
 
-  return data.values.reverse(); // oldest -> newest
+  return data.values.reverse();
 }
 
 function mergeByDatetime(existing, incoming) {
@@ -52,16 +52,8 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     body: JSON.stringify({
       model,
       instructions,
-
-      // Use a plain string input
       input,
-
-      // Key fix: control reasoning and allow enough total output tokens
-      reasoning: { effort: "low", summary: "auto" },
-
-      // IMPORTANT: this is total output tokens (reasoning + final text)
-      max_output_tokens: 5000,
-
+      max_output_tokens: 1500,
       store: false,
     }),
   });
@@ -71,12 +63,12 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     throw new Error("OpenAI error: " + JSON.stringify(data));
   }
 
-  // If OpenAI provided helper output_text, use it
+  // Use plain text output
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // Fallback: try to find text in output items
+  // Fallback: extract text from output messages
   if (Array.isArray(data.output)) {
     for (const item of data.output) {
       if (item && item.type === "message" && Array.isArray(item.content)) {
@@ -88,7 +80,6 @@ async function callOpenAI({ apiKey, model, instructions, input }) {
     }
   }
 
-  // Last resort: return full JSON so we can debug
   return JSON.stringify(data);
 }
 
@@ -107,18 +98,13 @@ module.exports = async (req, res) => {
 
     const model = process.env.OPENAI_MODEL || "gpt-5";
 
-    // 1) Read existing candles
     const existing = await redis.get(cfg.key);
-
-    // 2) Fetch latest candles and merge
     const latest = await fetchCandles(cfg.interval, cfg.fetch, twelveKey);
     const merged = mergeByDatetime(existing, latest);
 
-    // 3) Store rolling window
     const trimmed = merged.slice(Math.max(0, merged.length - cfg.keep));
     await redis.set(cfg.key, trimmed);
 
-    // 4) Limit candles sent to model (keeps cost/latency down)
     const defaultN = tf === "5M" ? 300 : tf === "1H" ? 200 : 60;
     const candlesForModel = trimmed.slice(Math.max(0, trimmed.length - defaultN));
 
@@ -127,7 +113,6 @@ module.exports = async (req, res) => {
         ? candlesForModel[candlesForModel.length - 1].datetime
         : null;
 
-    // 5) Build modular prompt
     const basic = basicBlock();
     const del1 = dailyBiasBlock();
 
@@ -136,19 +121,17 @@ module.exports = async (req, res) => {
 
     const input =
       `${basic}\n\n` +
-      `OUTPUT FORMAT (MANDATORY)\n` +
-      `Basic\n` +
-      `Date / Time (Europe/Oslo)\n\n` +
+      `OUTPUT FORMAT\n` +
+      `Basic\nDate / Time (Europe/Oslo)\n\n` +
       `Del 1 – Daily Bias\n\n` +
       `${del1}\n\n` +
-      `DATA (JSON, oldest -> newest)\n` +
+      `DATA (JSON)\n` +
       `SYMBOL: EURUSD\n` +
       `TIMEFRAME: ${tf}\n` +
       `LAST_DATETIME: ${lastDatetime}\n\n` +
       `${JSON.stringify(candlesForModel)}\n\n` +
       `QUESTION:\n${question}\n`;
 
-    // 6) Call OpenAI
     const answer = await callOpenAI({
       apiKey: openaiKey,
       model,
