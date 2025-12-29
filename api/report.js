@@ -6,7 +6,44 @@ const redis = new Redis({
 });
 
 const SYMBOL = "EUR/USD";
-const TD_TIMEZONE = "Europe/Oslo"; // <-- FORCE Oslo time for ALL returned datetimes
+
+// TwelveData is returning datetimes ~+10 hours vs Oslo in your setup.
+// We correct it here so everything downstream (Asia/London windows) matches Oslo time.
+const TIME_SHIFT_HOURS = -10; // 10:20 -> 00:20
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function shiftDatetimeString(dtStr, shiftHours) {
+  // dtStr formats:
+  // - intraday: "YYYY-MM-DD HH:MM:SS"
+  // - daily:    "YYYY-MM-DD"
+  const s = String(dtStr || "").trim();
+  if (!s) return s;
+
+  if (!s.includes(" ")) {
+    // daily candle date only: leave as-is
+    return s;
+  }
+
+  const [datePart, timePart] = s.split(" ");
+  const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
+  const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
+
+  // Treat as "floating" time and shift wall-clock hours safely using UTC arithmetic
+  const t = Date.UTC(Y, M - 1, D, hh, mm, ss || 0);
+  const shifted = new Date(t + shiftHours * 3600 * 1000);
+
+  const y2 = shifted.getUTCFullYear();
+  const m2 = pad2(shifted.getUTCMonth() + 1);
+  const d2 = pad2(shifted.getUTCDate());
+  const h2 = pad2(shifted.getUTCHours());
+  const min2 = pad2(shifted.getUTCMinutes());
+  const s2 = pad2(shifted.getUTCSeconds());
+
+  return `${y2}-${m2}-${d2} ${h2}:${min2}:${s2}`;
+}
 
 async function fetchTwelveData(interval, outputsize, apiKey) {
   const url =
@@ -14,7 +51,6 @@ async function fetchTwelveData(interval, outputsize, apiKey) {
     `?symbol=${encodeURIComponent(SYMBOL)}` +
     `&interval=${encodeURIComponent(interval)}` +
     `&outputsize=${encodeURIComponent(String(outputsize))}` +
-    `&timezone=${encodeURIComponent(TD_TIMEZONE)}` +
     `&apikey=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url);
@@ -25,7 +61,13 @@ async function fetchTwelveData(interval, outputsize, apiKey) {
   }
 
   // newest->oldest => reverse to oldest->newest
-  return data.values.reverse();
+  const values = data.values.reverse();
+
+  // Shift intraday datetimes into Oslo-aligned wall-clock time
+  return values.map((c) => ({
+    ...c,
+    datetime: shiftDatetimeString(c.datetime, TIME_SHIFT_HOURS),
+  }));
 }
 
 function mergeByDatetime(existing, incoming) {
@@ -113,21 +155,14 @@ function computeDailyScoreAndBias(dailyCandles) {
 function compute0800to0900(m5Candles) {
   if (!Array.isArray(m5Candles) || m5Candles.length === 0) return "N/A";
 
-  const inWindow = m5Candles.filter((c) => {
-    const dt = String(c.datetime || "");
-    return dt.includes(" 08:");
-  });
-
+  const inWindow = m5Candles.filter((c) => String(c.datetime || "").includes(" 08:"));
   if (inWindow.length === 0) return "N/A";
 
   const first = inWindow[0];
   const last = inWindow[inWindow.length - 1];
 
-  const o = first.open;
-  const cl = last.close;
-
-  if (o == null || cl == null) return "N/A";
-  return `Open ${o} → Close ${cl}`;
+  if (first.open == null || last.close == null) return "N/A";
+  return `Open ${first.open} → Close ${last.close}`;
 }
 
 module.exports = async (req, res) => {
@@ -137,21 +172,34 @@ module.exports = async (req, res) => {
       return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
     }
 
-    // 1) Refresh 1D (timezone forced)
+    // 1) Refresh 1D (daily has date-only, we keep as-is)
     const existing1D = await redis.get("candles:EURUSD:1D");
-    const latest1D = await fetchTwelveData("1day", 120, twelveKey);
-    const merged1D = mergeByDatetime(existing1D, latest1D);
+    const latest1D_raw = await (async () => {
+      const url =
+        `https://api.twelvedata.com/time_series` +
+        `?symbol=${encodeURIComponent(SYMBOL)}` +
+        `&interval=1day` +
+        `&outputsize=120` +
+        `&apikey=${encodeURIComponent(twelveKey)}`;
+
+      const r = await fetch(url);
+      const d = await r.json();
+      if (!d.values) throw new Error("TwelveData response: " + JSON.stringify(d));
+      return d.values.reverse(); // oldest->newest
+    })();
+
+    const merged1D = mergeByDatetime(existing1D, latest1D_raw);
     const dailyKept = merged1D.slice(Math.max(0, merged1D.length - 120));
     await redis.set("candles:EURUSD:1D", dailyKept);
 
-    // 2) Refresh 1H (timezone forced)
+    // 2) Refresh 1H (shifted)
     const existing1H = await redis.get("candles:EURUSD:1H");
     const latest1H = await fetchTwelveData("1h", 600, twelveKey);
     const merged1H = mergeByDatetime(existing1H, latest1H);
     const h1Kept = merged1H.slice(Math.max(0, merged1H.length - 600));
     await redis.set("candles:EURUSD:1H", h1Kept);
 
-    // 3) Refresh 5M (timezone forced)
+    // 3) Refresh 5M (shifted) — defines "now"
     const existing5M = await redis.get("candles:EURUSD:5M");
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
     const merged5M = mergeByDatetime(existing5M, latest5M);
@@ -161,21 +209,17 @@ module.exports = async (req, res) => {
     const now = m5Kept.length ? m5Kept[m5Kept.length - 1].datetime : null;
 
     const dailyResult = computeDailyScoreAndBias(dailyKept);
-
-    let bias09 = dailyResult.ok ? dailyResult.baseBias : "Ranging";
-    let bias10 = dailyResult.ok ? dailyResult.baseBias : "Ranging";
+    const bias09 = dailyResult.ok ? dailyResult.baseBias : "Ranging";
+    const bias10 = dailyResult.ok ? dailyResult.baseBias : "Ranging";
 
     const m5ForWindow = m5Kept.slice(Math.max(0, m5Kept.length - 180));
     const candle0809 = compute0800to0900(m5ForWindow);
-
-    const londonScenario = "N/A";
 
     const answerLines = [];
     answerLines.push("Basic");
     answerLines.push(`Dato, tid: ${now || "N/A"}`);
     answerLines.push("");
     answerLines.push("Del1 - Daily Bias");
-
     if (!dailyResult.ok) {
       answerLines.push("Score: N/A");
       answerLines.push("Trade: No");
@@ -187,37 +231,15 @@ module.exports = async (req, res) => {
       answerLines.push(`Bias 09: ${bias09}`);
       answerLines.push(`Bias 10: ${bias10}`);
     }
-
-    answerLines.push(`London scenario: ${londonScenario}`);
+    answerLines.push("London scenario: N/A");
     answerLines.push(`08:00–09:00 candle: ${candle0809}`);
-
-    const answer = answerLines.join("\n");
 
     return res.status(200).json({
       ok: true,
-      timezone: TD_TIMEZONE,
+      timeShiftHoursApplied: TIME_SHIFT_HOURS,
       now,
-      keys: {
-        d1: "candles:EURUSD:1D",
-        h1: "candles:EURUSD:1H",
-        m5: "candles:EURUSD:5M",
-      },
-      counts: {
-        d1: dailyKept.length,
-        h1: h1Kept.length,
-        m5: m5Kept.length,
-      },
-      dailyDebug: dailyResult.ok
-        ? {
-            d1_datetime: dailyResult.d1.datetime,
-            d2_datetime: dailyResult.d2.datetime,
-            close_position: Number(dailyResult.closePos.toFixed(4)),
-            inside_day: dailyResult.insideDay,
-            overlap_regime: dailyResult.overlapRegime,
-            overlap_pct_of_smaller_range: Number(dailyResult.overlapPct.toFixed(4)),
-          }
-        : { ok: false, reason: dailyResult.reason },
-      answer,
+      counts: { d1: dailyKept.length, h1: h1Kept.length, m5: m5Kept.length },
+      answer: answerLines.join("\n"),
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
