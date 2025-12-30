@@ -11,44 +11,9 @@ function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
-function toNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : NaN;
-}
-
-function parseDatetimeToUTCms(dtStr) {
-  const s = String(dtStr || "").trim();
-  if (!s) return null;
-
-  if (!s.includes(" ")) {
-    const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
-    if (!Y || !M || !D) return null;
-    return Date.UTC(Y, M - 1, D, 0, 0, 0);
-  }
-
-  const [datePart, timePart] = s.split(" ");
-  const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
-  const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
-  if (!Y || !M || !D) return null;
-  return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
-}
-
-function formatUTCmsAsDatetime(ms) {
-  const d = new Date(ms);
-  const y = d.getUTCFullYear();
-  const m = pad2(d.getUTCMonth() + 1);
-  const day = pad2(d.getUTCDate());
-  const h = pad2(d.getUTCHours());
-  const min = pad2(d.getUTCMinutes());
-  const s = pad2(d.getUTCSeconds());
-  return `${y}-${m}-${day} ${h}:${min}:${s}`;
-}
-
-// Oslo is UTC+1 in winter, UTC+2 in summer.
-// For now (Dec 30) it's UTC+1. We'll compute offset dynamically using Intl.
-function getOsloOffsetMinutes(date = new Date()) {
-  // We compute offset by formatting date in Oslo and UTC, then comparing components.
-  const dtfOslo = new Intl.DateTimeFormat("en-GB", {
+// Return Oslo time as sortable string: "YYYY-MM-DD HH:MM:SS"
+function getOsloNowString() {
+  const dtf = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Oslo",
     year: "numeric",
     month: "2-digit",
@@ -58,43 +23,22 @@ function getOsloOffsetMinutes(date = new Date()) {
     second: "2-digit",
     hourCycle: "h23",
   });
-  const dtfUtc = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "UTC",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  });
 
-  const partsToObj = (parts) => {
-    const o = {};
-    for (const p of parts) if (p.type !== "literal") o[p.type] = p.value;
-    return o;
-  };
+  const parts = dtf.formatToParts(new Date());
+  const obj = {};
+  for (const p of parts) if (p.type !== "literal") obj[p.type] = p.value;
 
-  const o = partsToObj(dtfOslo.formatToParts(date));
-  const u = partsToObj(dtfUtc.formatToParts(date));
-
-  // build ms from the displayed wall times, interpret them as UTC, then diff
-  const osloAsUTC = Date.UTC(+o.year, +o.month - 1, +o.day, +o.hour, +o.minute, +o.second);
-  const utcAsUTC = Date.UTC(+u.year, +u.month - 1, +u.day, +u.hour, +u.minute, +u.second);
-
-  return Math.round((osloAsUTC - utcAsUTC) / 60000);
+  // en-CA gives YYYY-MM-DD ordering via parts
+  return `${obj.year}-${obj.month}-${obj.day} ${obj.hour}:${obj.minute}:${obj.second}`;
 }
 
-function getOsloNowRoundedTo5mUTCms() {
-  const now = new Date();
-  const offsetMin = getOsloOffsetMinutes(now); // minutes Oslo ahead of UTC
-  const utcMs = now.getTime();
-  const osloMs = utcMs + offsetMin * 60000;
-
-  const roundedOsloMs = Math.floor(osloMs / (5 * 60000)) * (5 * 60000);
-
-  // convert back to UTC ms for comparisons
-  return roundedOsloMs - offsetMin * 60000;
+// Round down to 5-minute boundary in Oslo time, keep as string "YYYY-MM-DD HH:MM:SS"
+function roundDownOsloTo5m(osloStr) {
+  // osloStr: "YYYY-MM-DD HH:MM:SS"
+  const [d, t] = osloStr.split(" ");
+  const [hh, mm, ss] = t.split(":").map((x) => parseInt(x, 10));
+  const roundedMin = Math.floor(mm / 5) * 5;
+  return `${d} ${pad2(hh)}:${pad2(roundedMin)}:00`;
 }
 
 async function fetchTwelveDataRaw(interval, outputsize, apiKey) {
@@ -108,9 +52,7 @@ async function fetchTwelveDataRaw(interval, outputsize, apiKey) {
   const res = await fetch(url, { headers: { "Cache-Control": "no-cache" } });
   const data = await res.json();
 
-  if (!data.values) {
-    throw new Error("TwelveData response: " + JSON.stringify(data));
-  }
+  if (!data.values) throw new Error("TwelveData response: " + JSON.stringify(data));
 
   return data.values.reverse(); // oldest->newest
 }
@@ -125,14 +67,19 @@ function mergeByDatetime(existing, incoming) {
   );
 }
 
-function filterNotAfter(candles, maxUtcMs) {
+// Filter candles by string compare (works because format is YYYY-MM-DD HH:MM:SS)
+function filterNotAfterStr(candles, maxStr) {
   const out = [];
   for (const c of Array.isArray(candles) ? candles : []) {
-    const ms = parseDatetimeToUTCms(c.datetime);
-    if (ms == null) continue;
-    if (ms <= maxUtcMs) out.push(c);
+    const dt = String(c.datetime || "");
+    if (dt && dt <= maxStr) out.push(c);
   }
   return out;
+}
+
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : NaN;
 }
 
 function computeDailyScoreAndBias(dailyCandles) {
@@ -156,6 +103,7 @@ function computeDailyScoreAndBias(dailyCandles) {
   }
 
   const closePos = (d1Close - d1Low) / range;
+
   const insideDay = d1High <= d2High && d1Low >= d2Low;
 
   const overlap = Math.max(0, Math.min(d1High, d2High) - Math.max(d1Low, d2Low));
@@ -199,17 +147,19 @@ module.exports = async (req, res) => {
     if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY" });
 
     const serverNowIso = new Date().toISOString();
-    const osloNowRoundedUtcMs = getOsloNowRoundedTo5mUTCms();
-    const osloNowRoundedStr = formatUTCmsAsDatetime(osloNowRoundedUtcMs);
+    const osloNow = getOsloNowString();              // e.g. "2025-12-30 01:08:12"
+    const osloNowRounded = roundDownOsloTo5m(osloNow); // e.g. "2025-12-30 01:05:00"
 
-    // Fetch raw
+    // Fetch raw candles
     const latest1D_raw = await fetchTwelveDataRaw("1day", 120, twelveKey);
     const latest1H_raw = await fetchTwelveDataRaw("1h", 600, twelveKey);
     const latest5M_raw = await fetchTwelveDataRaw("5min", 2500, twelveKey);
 
-    // Filter out any candles "after now" (based on Oslo-rounded now)
-    const latest1H = filterNotAfter(latest1H_raw, osloNowRoundedUtcMs);
-    const latest5M = filterNotAfter(latest5M_raw, osloNowRoundedUtcMs);
+    const rawNow5m = latest5M_raw.length ? latest5M_raw[latest5M_raw.length - 1].datetime : null;
+
+    // Filter out "future" candles relative to Oslo rounded now
+    const latest1H = filterNotAfterStr(latest1H_raw, osloNowRounded);
+    const latest5M = filterNotAfterStr(latest5M_raw, osloNowRounded);
 
     // Store merged
     const dailyKept = mergeByDatetime(await redis.get("candles:EURUSD:1D"), latest1D_raw).slice(-120);
@@ -220,9 +170,9 @@ module.exports = async (req, res) => {
     await redis.set("candles:EURUSD:1H", h1Kept);
     await redis.set("candles:EURUSD:5M", m5Kept);
 
-    const dailyResult = computeDailyScoreAndBias(dailyKept);
+    const now = m5Kept.length ? m5Kept[m5Kept.length - 1].datetime : osloNowRounded;
 
-    const now = m5Kept.length ? m5Kept[m5Kept.length - 1].datetime : osloNowRoundedStr;
+    const dailyResult = computeDailyScoreAndBias(dailyKept);
 
     const answerLines = [];
     answerLines.push("Basic");
@@ -247,10 +197,11 @@ module.exports = async (req, res) => {
       ok: true,
       debug: {
         serverNowIso,
-        osloNowRoundedStr,
-        rawNow5m: latest5M_raw.length ? latest5M_raw[latest5M_raw.length - 1].datetime : null,
-        filteredNow5m: now,
+        osloNow,
+        osloNowRounded,
+        rawNow5m,
         filtered5mCount: latest5M.length,
+        lastStored5m: now,
       },
       counts: { d1: dailyKept.length, h1: h1Kept.length, m5: m5Kept.length },
       answer: answerLines.join("\n"),
