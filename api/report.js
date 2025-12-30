@@ -12,8 +12,11 @@ const OSLO_TZ = "Europe/Oslo";
 // Prompt blocks (existing Del1)
 const del1_dailyBiasPromptBlock = require("./analysis/del1_dailyBias.js");
 
-// Del2 module (new file)
+// Del2 module
 const { computeDel2Asia, del2_asiaRangePromptBlock } = require("./analysis/del2_asiaRange.js");
+
+// Del3 module (new)
+const { computeDel3Sessions, del3_dailyCyclesPromptBlock } = require("./analysis/del3_dailyCycles.js");
 
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
@@ -71,7 +74,7 @@ function toNum(x) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-// Keep your existing daily compute here for now (since Del1 file you provided is prompt-only)
+// Del1 compute still lives here for now (your del1 file is prompt-only)
 function computeDailyScoreAndBias(dailyCandles) {
   if (!Array.isArray(dailyCandles) || dailyCandles.length < 2) {
     return { ok: false, reason: "Not enough daily candles for D-1/D-2" };
@@ -139,12 +142,10 @@ module.exports = async (req, res) => {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
     if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
 
-    // Fetch fresh UTC series
     const latest1D = await fetchTwelveData("1day", 120, twelveKey);
     const latest1H = await fetchTwelveData("1h", 600, twelveKey);
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
 
-    // Overwrite Redis completely
     await redis.set("candles:EURUSD:1D", latest1D);
     await redis.set("candles:EURUSD:1H", latest1H);
     await redis.set("candles:EURUSD:5M", latest5M);
@@ -152,18 +153,14 @@ module.exports = async (req, res) => {
     const nowUtc = latest5M.length ? latest5M[latest5M.length - 1].datetime : null;
     const nowOslo = nowUtc ? formatMsInOslo(parseUtcDatetimeToMs(nowUtc)) : null;
 
-    // Del1 compute (temporary living here) + Del1 prompt (from your file)
     const dailyResult = computeDailyScoreAndBias(latest1D);
-    const del1Prompt = del1_dailyBiasPromptBlock(); // your rules text
-
-    // 08:00–09:00 candle
     const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
 
-    // Del2 compute + Del2 prompt (from del2 file)
     const { del2_asiaRange, del2_asiaBreak } = computeDel2Asia(latest5M, nowUtc);
-    const del2Prompt = del2_asiaRangePromptBlock();
 
-    // Build answer text (same style as before, now with Del2)
+    // Del3 sessions (v0)
+    const del3_sessions = computeDel3Sessions(latest5M, nowUtc);
+
     const answerLines = [];
     answerLines.push("Basic");
     answerLines.push(`Dato, tid (Oslo): ${nowOslo || "N/A"}`);
@@ -214,24 +211,38 @@ module.exports = async (req, res) => {
       answerLines.push(`N/A: ${del2_asiaBreak.reason}`);
     }
 
+    // Optional: show Del3 session summary in answer (short)
+    answerLines.push("");
+    answerLines.push("Del3 - Session Cycles (v0)");
+    if (del3_sessions.ok) {
+      answerLines.push(`Oslo date: ${del3_sessions.osloDate}`);
+      for (const [k, v] of Object.entries(del3_sessions.sessions)) {
+        if (v && v.ok) {
+          answerLines.push(`${k}: High ${v.high} / Low ${v.low} (candles ${v.candlesCount})`);
+        } else {
+          answerLines.push(`${k}: N/A`);
+        }
+      }
+    } else {
+      answerLines.push(`N/A: ${del3_sessions.reason}`);
+    }
+
     return res.status(200).json({
       ok: true,
       timezoneRequestedFromTwelveData: TD_TIMEZONE,
       nowUtc,
       nowOslo,
       counts: { d1: latest1D.length, h1: latest1H.length, m5: latest5M.length },
-
-      // the report text
       answer: answerLines.join("\n"),
 
-      // structured compute outputs
       del2_asiaRange,
       del2_asiaBreak,
+      del3_sessions,
 
-      // prompt blocks per module (for later ChatGPT/Telegram use)
       prompts: {
-        del1_dailyBias: del1Prompt,
-        del2_asiaRange: del2Prompt,
+        del1_dailyBias: del1_dailyBiasPromptBlock(),
+        del2_asiaRange: del2_asiaRangePromptBlock(),
+        del3_dailyCycles: del3_dailyCyclesPromptBlock(),
       },
     });
   } catch (err) {
