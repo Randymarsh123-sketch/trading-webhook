@@ -59,4 +59,4 @@ STRICT
 - No explanations
 - No extra headings
 `.trim();
-}
+};
