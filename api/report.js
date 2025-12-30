@@ -9,7 +9,6 @@ const SYMBOL = "EUR/USD";
 const TD_TIMEZONE = "UTC";
 const OSLO_TZ = "Europe/Oslo";
 
-// IMPORTANT: analysis files are now in repo root: /analysis (NOT under /api)
 const del1_dailyBiasPromptBlock = require("../analysis/del1_dailyBias.js");
 const { computeDel2Asia, del2_asiaRangePromptBlock } = require("../analysis/del2_asiaRange.js");
 const { computeDel3Sessions, del3_dailyCyclesPromptBlock } = require("../analysis/del3_dailyCycles.js");
@@ -70,7 +69,6 @@ function toNum(x) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-// NOTE: Del1 compute is still here for now because your del1 file is a prompt block (rules text).
 function computeDailyScoreAndBias(dailyCandles) {
   if (!Array.isArray(dailyCandles) || dailyCandles.length < 2) {
     return { ok: false, reason: "Not enough daily candles for D-1/D-2" };
@@ -138,12 +136,10 @@ module.exports = async (req, res) => {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
     if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
 
-    // Fetch fresh UTC series
     const latest1D = await fetchTwelveData("1day", 120, twelveKey);
     const latest1H = await fetchTwelveData("1h", 600, twelveKey);
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
 
-    // Overwrite Redis completely
     await redis.set("candles:EURUSD:1D", latest1D);
     await redis.set("candles:EURUSD:1H", latest1H);
     await redis.set("candles:EURUSD:5M", latest5M);
@@ -217,6 +213,33 @@ module.exports = async (req, res) => {
         } else {
           answerLines.push(`${k}: N/A`);
         }
+      }
+
+      // NEW: Asia sweep status summary
+      answerLines.push("");
+      answerLines.push("Del3 - Asia Sweep Status (vs Asia High/Low)");
+      const s = del3_sessions.asiaSweepStatus;
+      if (s && s.ok) {
+        answerLines.push(`Asia High: ${s.asiaHigh}`);
+        answerLines.push(`Asia Low: ${s.asiaLow}`);
+        answerLines.push(`First taken: ${s.firstTaken}`);
+
+        if (s.firstEvent) {
+          if (s.firstEvent.type === "BOTH") {
+            answerLines.push(`First event (BOTH): ${s.firstEvent.tsOslo} (UTC ${s.firstEvent.tsUtc})`);
+            answerLines.push(`High price: ${s.firstEvent.highPrice}`);
+            answerLines.push(`Low price: ${s.firstEvent.lowPrice}`);
+          } else {
+            answerLines.push(`First event: ${s.firstEvent.type} in ${s.firstEvent.session}`);
+            answerLines.push(`Time Oslo: ${s.firstEvent.tsOslo}`);
+            answerLines.push(`Time UTC: ${s.firstEvent.tsUtc}`);
+            answerLines.push(`Price: ${s.firstEvent.price}`);
+          }
+        } else {
+          answerLines.push("First event: N/A");
+        }
+      } else {
+        answerLines.push("N/A");
       }
     } else {
       answerLines.push(`N/A: ${del3_sessions.reason}`);
