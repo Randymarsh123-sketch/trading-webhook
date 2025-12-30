@@ -1,6 +1,3 @@
-// api/analysis/del2_asiaRange.js
-// Del2: Asia Range + Break (Oslo time logic) + prompt block
-
 const OSLO_TZ = "Europe/Oslo";
 
 function parseUtcDatetimeToMs(dtStr) {
@@ -15,7 +12,6 @@ function parseUtcDatetimeToMs(dtStr) {
     return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
   }
 
-  // not expected for 5M, but safe
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
     if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
@@ -82,7 +78,6 @@ function computeAsiaRange_0200_0659_Oslo(latest5M, nowUtcStr) {
 
     const { hh, mm } = getOsloHHMM_fromMs(ms);
 
-    // 02:00–06:59 inclusive
     const afterStart = hh > 2 || (hh === 2 && mm >= 0);
     const beforeEnd = hh < 6 || (hh === 6 && mm <= 59);
     if (!afterStart || !beforeEnd) continue;
@@ -170,7 +165,6 @@ function computeAsiaBreakAfter0700_Oslo(latest5M, del2_asiaRange) {
 
     if (!brokeUp && !brokeDown) continue;
 
-    // If both in same candle, choose stronger distance beyond level
     let breakDirection = "UP";
     let breakPrice = h;
 
