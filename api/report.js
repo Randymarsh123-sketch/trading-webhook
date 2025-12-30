@@ -9,14 +9,10 @@ const SYMBOL = "EUR/USD";
 const TD_TIMEZONE = "UTC";
 const OSLO_TZ = "Europe/Oslo";
 
-// Prompt blocks (existing Del1)
-const del1_dailyBiasPromptBlock = require("./analysis/del1_dailyBias.js");
-
-// Del2 module
-const { computeDel2Asia, del2_asiaRangePromptBlock } = require("./analysis/del2_asiaRange.js");
-
-// Del3 module (new)
-const { computeDel3Sessions, del3_dailyCyclesPromptBlock } = require("./analysis/del3_dailyCycles.js");
+// prompt blocks on root /analysis (NOT inside /api)
+const del1_dailyBiasPromptBlock = require("../analysis/del1_dailyBias.js");
+const { computeDel2Asia, del2_asiaRangePromptBlock } = require("../analysis/del2_asiaRange.js");
+const { computeDel3Sessions, del3_dailyCyclesPromptBlock } = require("../analysis/del3_dailyCycles.js");
 
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
@@ -66,7 +62,7 @@ async function fetchTwelveData(interval, outputsize, apiKey) {
   const res = await fetch(url, { headers: { "Cache-Control": "no-cache" } });
   const data = await res.json();
   if (!data.values) throw new Error("TwelveData response: " + JSON.stringify(data));
-  return data.values.reverse(); // oldest->newest
+  return data.values.reverse();
 }
 
 function toNum(x) {
@@ -74,7 +70,7 @@ function toNum(x) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-// Del1 compute still lives here for now (your del1 file is prompt-only)
+// Del1 compute still here for now (Del1 file is prompt-only)
 function computeDailyScoreAndBias(dailyCandles) {
   if (!Array.isArray(dailyCandles) || dailyCandles.length < 2) {
     return { ok: false, reason: "Not enough daily candles for D-1/D-2" };
@@ -157,8 +153,6 @@ module.exports = async (req, res) => {
     const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
 
     const { del2_asiaRange, del2_asiaBreak } = computeDel2Asia(latest5M, nowUtc);
-
-    // Del3 sessions (v0)
     const del3_sessions = computeDel3Sessions(latest5M, nowUtc);
 
     const answerLines = [];
@@ -211,7 +205,6 @@ module.exports = async (req, res) => {
       answerLines.push(`N/A: ${del2_asiaBreak.reason}`);
     }
 
-    // Optional: show Del3 session summary in answer (short)
     answerLines.push("");
     answerLines.push("Del3 - Session Cycles (v0)");
     if (del3_sessions.ok) {
