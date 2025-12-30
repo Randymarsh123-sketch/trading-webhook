@@ -1,14 +1,3 @@
-// api/analysis/del3_dailyCycles.js
-// Del3 (v0): Session-cycles only (Oslo time)
-// - Asia: 02:00–06:59
-// - Frankfurt: 08:00–08:59
-// - London cutoff/fakeout: 09:00–09:30
-// - London main move: 10:00–13:59
-//
-// Purpose right now:
-// - Provide clean, editable session data + prompt block
-// - No advanced "daily cycles" logic yet (Judas/whipsaw/dead-frankfurt etc. later)
-
 const OSLO_TZ = "Europe/Oslo";
 
 function parseUtcDatetimeToMs(dtStr) {
@@ -54,7 +43,7 @@ function getOsloDateKeyFromMs(ms) {
 }
 
 function getOsloHHMM_fromMs(ms) {
-  const osloStr = formatMsInOslo(ms); // "YYYY-MM-DD HH:mm:ss"
+  const osloStr = formatMsInOslo(ms);
   const hh = parseInt(osloStr.slice(11, 13), 10);
   const mm = parseInt(osloStr.slice(14, 16), 10);
   return { hh, mm, osloStr };
@@ -66,25 +55,14 @@ function toNum(x) {
 }
 
 function inTimeWindowOslo(hh, mm, startHH, startMM, endHH, endMM, inclusiveEnd) {
-  // assumes same day; compares hh:mm against start and end
   const afterStart = hh > startHH || (hh === startHH && mm >= startMM);
   let beforeEnd = hh < endHH || (hh === endHH && mm < endMM);
-  if (inclusiveEnd) {
-    beforeEnd = hh < endHH || (hh === endHH && mm <= endMM);
-  }
+  if (inclusiveEnd) beforeEnd = hh < endHH || (hh === endHH && mm <= endMM);
   return afterStart && beforeEnd;
 }
 
-// Build session stats from 5M candles based on Oslo date + time window
 function computeSessionStats(latest5M, targetOsloDate, window) {
-  const {
-    name,
-    startHH,
-    startMM,
-    endHH,
-    endMM,
-    inclusiveEnd = true,
-  } = window;
+  const { name, startHH, startMM, endHH, endMM, inclusiveEnd = true } = window;
 
   if (!Array.isArray(latest5M) || latest5M.length === 0) {
     return { ok: false, name, reason: "No 5M candles" };
@@ -151,7 +129,6 @@ function computeSessionStats(latest5M, targetOsloDate, window) {
   };
 }
 
-// Main entry: compute all sessions for "today" Oslo date derived from nowUtc
 function computeDel3Sessions(latest5M, nowUtcStr) {
   const nowMs = parseUtcDatetimeToMs(nowUtcStr);
   if (nowMs == null) return { ok: false, reason: "Invalid nowUtc" };
@@ -161,7 +138,6 @@ function computeDel3Sessions(latest5M, nowUtcStr) {
   const windows = [
     { name: "Asia", startHH: 2, startMM: 0, endHH: 6, endMM: 59, inclusiveEnd: true },
     { name: "Frankfurt", startHH: 8, startMM: 0, endHH: 8, endMM: 59, inclusiveEnd: true },
-    // 09:00–09:30 (inclusive end gives us 09:30 candle; if you later want to exclude 09:30, set inclusiveEnd:false)
     { name: "London cutoff/fakeout", startHH: 9, startMM: 0, endHH: 9, endMM: 30, inclusiveEnd: true },
     { name: "London main move", startHH: 10, startMM: 0, endHH: 13, endMM: 59, inclusiveEnd: true },
   ];
@@ -171,11 +147,7 @@ function computeDel3Sessions(latest5M, nowUtcStr) {
     sessions[w.name] = computeSessionStats(latest5M, osloDate, w);
   }
 
-  return {
-    ok: true,
-    osloDate,
-    sessions,
-  };
+  return { ok: true, osloDate, sessions };
 }
 
 function del3_dailyCyclesPromptBlock() {
