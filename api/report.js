@@ -7,19 +7,34 @@ const redis = new Redis({
 
 const SYMBOL = "EUR/USD";
 const TD_TIMEZONE = "UTC";
+const OSLO_TZ = "Europe/Oslo";
 
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
-  if (!s || !s.includes(" ")) return null;
-  const [datePart, timePart] = s.split(" ");
-  const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
-  const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
-  return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
+  if (!s) return null;
+
+  // TwelveData intraday: "YYYY-MM-DD HH:mm:ss"
+  if (s.includes(" ")) {
+    const [datePart, timePart] = s.split(" ");
+    const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
+    const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
+    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
+    return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
+  }
+
+  // Daily can be "YYYY-MM-DD"
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
+    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
+    return Date.UTC(Y, M - 1, D, 0, 0, 0);
+  }
+
+  return null;
 }
 
 function formatMsInOslo(ms) {
   const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Oslo",
+    timeZone: OSLO_TZ,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -32,6 +47,11 @@ function formatMsInOslo(ms) {
   const obj = {};
   for (const p of parts) if (p.type !== "literal") obj[p.type] = p.value;
   return `${obj.year}-${obj.month}-${obj.day} ${obj.hour}:${obj.minute}:${obj.second}`;
+}
+
+function getOsloDateKeyFromMs(ms) {
+  // returns "YYYY-MM-DD" in Oslo
+  return String(formatMsInOslo(ms)).slice(0, 10);
 }
 
 async function fetchTwelveData(interval, outputsize, apiKey) {
@@ -116,6 +136,88 @@ function compute0800to0900_fromUTC(m5CandlesLast180) {
   return `Open ${inWindow[0].open} → Close ${inWindow[inWindow.length - 1].close}`;
 }
 
+// ---------------------------
+// DEL2 – Asia Range (02:00–06:59 Oslo)
+// ---------------------------
+function computeAsiaRange_0200_0659_Oslo(latest5M, nowUtcStr) {
+  if (!Array.isArray(latest5M) || latest5M.length === 0) {
+    return { ok: false, reason: "No 5M candles" };
+  }
+  const nowMs = parseUtcDatetimeToMs(nowUtcStr);
+  if (nowMs == null) {
+    return { ok: false, reason: "Invalid nowUtc for Asia range" };
+  }
+
+  const targetOsloDate = getOsloDateKeyFromMs(nowMs); // YYYY-MM-DD
+
+  const windowStart = "02:00";
+  const windowEnd = "06:59";
+
+  const inWindow = [];
+
+  for (const c of latest5M) {
+    const ms = parseUtcDatetimeToMs(c.datetime);
+    if (ms == null) continue;
+
+    // must be same Oslo date as "today"
+    if (getOsloDateKeyFromMs(ms) !== targetOsloDate) continue;
+
+    const osloStr = formatMsInOslo(ms); // "YYYY-MM-DD HH:mm:ss"
+    const hh = parseInt(osloStr.slice(11, 13), 10);
+    const mm = parseInt(osloStr.slice(14, 16), 10);
+
+    // 02:00–06:59 inclusive
+    const afterStart = hh > 2 || (hh === 2 && mm >= 0);
+    const beforeEnd = hh < 6 || (hh === 6 && mm <= 59);
+    if (!afterStart || !beforeEnd) continue;
+
+    const high = toNum(c.high);
+    const low = toNum(c.low);
+    if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
+
+    inWindow.push({ ms, high, low });
+  }
+
+  if (!inWindow.length) {
+    return {
+      ok: false,
+      reason: `No candles found in Asia window for Oslo date ${targetOsloDate}`,
+      asiaDateOslo: targetOsloDate,
+      windowOslo: { start: windowStart, end: windowEnd },
+      candlesCount: 0,
+    };
+  }
+
+  inWindow.sort((a, b) => a.ms - b.ms);
+
+  let asiaHigh = -Infinity;
+  let asiaLow = Infinity;
+
+  for (const row of inWindow) {
+    if (row.high > asiaHigh) asiaHigh = row.high;
+    if (row.low < asiaLow) asiaLow = row.low;
+  }
+
+  const startMs = inWindow[0].ms;
+  const endMs = inWindow[inWindow.length - 1].ms;
+
+  return {
+    ok: true,
+    asiaDateOslo: targetOsloDate,
+    windowOslo: { start: windowStart, end: windowEnd },
+    candlesCount: inWindow.length,
+
+    asiaHigh,
+    asiaLow,
+    asiaRange: asiaHigh - asiaLow,
+
+    startTsUtc: new Date(startMs).toISOString(),
+    endTsUtc: new Date(endMs).toISOString(),
+    startTsOslo: formatMsInOslo(startMs),
+    endTsOslo: formatMsInOslo(endMs),
+  };
+}
+
 module.exports = async (req, res) => {
   try {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
@@ -136,6 +238,9 @@ module.exports = async (req, res) => {
 
     const dailyResult = computeDailyScoreAndBias(latest1D);
     const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
+
+    // DEL2
+    const del2_asiaRange = computeAsiaRange_0200_0659_Oslo(latest5M, nowUtc);
 
     const answerLines = [];
     answerLines.push("Basic");
@@ -159,13 +264,33 @@ module.exports = async (req, res) => {
     answerLines.push("London scenario: N/A");
     answerLines.push(`08:00–09:00 candle: ${candle0809}`);
 
+    // Del2 output (for verifisering først)
+    answerLines.push("");
+    answerLines.push("Del2 - Asia Range (02:00–06:59 Oslo)");
+    if (del2_asiaRange.ok) {
+      answerLines.push(`Asia Date (Oslo): ${del2_asiaRange.asiaDateOslo}`);
+      answerLines.push(`Candles: ${del2_asiaRange.candlesCount}`);
+      answerLines.push(`High: ${del2_asiaRange.asiaHigh}`);
+      answerLines.push(`Low: ${del2_asiaRange.asiaLow}`);
+      answerLines.push(`Range: ${del2_asiaRange.asiaRange}`);
+      answerLines.push(`Start Oslo: ${del2_asiaRange.startTsOslo}`);
+      answerLines.push(`End Oslo: ${del2_asiaRange.endTsOslo}`);
+    } else {
+      answerLines.push(`N/A: ${del2_asiaRange.reason}`);
+    }
+
     return res.status(200).json({
       ok: true,
       timezoneRequestedFromTwelveData: TD_TIMEZONE,
       nowUtc,
       nowOslo,
       counts: { d1: latest1D.length, h1: latest1H.length, m5: latest5M.length },
+
+      // Existing output
       answer: answerLines.join("\n"),
+
+      // New structured output
+      del2_asiaRange,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
