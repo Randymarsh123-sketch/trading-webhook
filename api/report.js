@@ -6,13 +6,8 @@ const redis = new Redis({
 });
 
 const SYMBOL = "EUR/USD";
-const TD_TIMEZONE = "UTC"; // IMPORTANT: force UTC from TwelveData for intraday correctness
+const TD_TIMEZONE = "UTC";
 
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-
-// Parse "YYYY-MM-DD HH:MM:SS" as UTC
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
   if (!s || !s.includes(" ")) return null;
@@ -22,7 +17,6 @@ function parseUtcDatetimeToMs(dtStr) {
   return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
 }
 
-// Format ms as Oslo local time string "YYYY-MM-DD HH:MM:SS"
 function formatMsInOslo(ms) {
   const dtf = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Oslo",
@@ -53,13 +47,6 @@ async function fetchTwelveData(interval, outputsize, apiKey) {
   const data = await res.json();
   if (!data.values) throw new Error("TwelveData response: " + JSON.stringify(data));
   return data.values.reverse(); // oldest->newest
-}
-
-function mergeByDatetime(existing, incoming) {
-  const map = new Map();
-  for (const c of Array.isArray(existing) ? existing : []) map.set(c.datetime, c);
-  for (const c of Array.isArray(incoming) ? incoming : []) map.set(c.datetime, c);
-  return Array.from(map.values()).sort((a, b) => (a.datetime < b.datetime ? -1 : a.datetime > b.datetime ? 1 : 0));
 }
 
 function toNum(x) {
@@ -132,29 +119,23 @@ function compute0800to0900_fromUTC(m5CandlesLast180) {
 module.exports = async (req, res) => {
   try {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
-    if (!twelveKey) {
-      return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
-    }
+    if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
 
-    // Refresh candles from TwelveData (UTC)
+    // Fetch fresh UTC series
     const latest1D = await fetchTwelveData("1day", 120, twelveKey);
     const latest1H = await fetchTwelveData("1h", 600, twelveKey);
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
 
-    // Merge/store (keep UTC datetime strings)
-    const dailyKept = mergeByDatetime(await redis.get("candles:EURUSD:1D"), latest1D).slice(-120);
-    const h1Kept = mergeByDatetime(await redis.get("candles:EURUSD:1H"), latest1H).slice(-600);
-    const m5Kept = mergeByDatetime(await redis.get("candles:EURUSD:5M"), latest5M).slice(-2500);
+    // IMPORTANT: overwrite Redis completely for 1H/5M to remove old bad timestamps
+    await redis.set("candles:EURUSD:1D", latest1D); // daily is safe too; overwrite for simplicity
+    await redis.set("candles:EURUSD:1H", latest1H);
+    await redis.set("candles:EURUSD:5M", latest5M);
 
-    await redis.set("candles:EURUSD:1D", dailyKept);
-    await redis.set("candles:EURUSD:1H", h1Kept);
-    await redis.set("candles:EURUSD:5M", m5Kept);
-
-    const nowUtc = m5Kept.length ? m5Kept[m5Kept.length - 1].datetime : null;
+    const nowUtc = latest5M.length ? latest5M[latest5M.length - 1].datetime : null;
     const nowOslo = nowUtc ? formatMsInOslo(parseUtcDatetimeToMs(nowUtc)) : null;
 
-    const dailyResult = computeDailyScoreAndBias(dailyKept);
-    const candle0809 = compute0800to0900_fromUTC(m5Kept.slice(-180));
+    const dailyResult = computeDailyScoreAndBias(latest1D);
+    const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
 
     const answerLines = [];
     answerLines.push("Basic");
@@ -183,7 +164,7 @@ module.exports = async (req, res) => {
       timezoneRequestedFromTwelveData: TD_TIMEZONE,
       nowUtc,
       nowOslo,
-      counts: { d1: dailyKept.length, h1: h1Kept.length, m5: m5Kept.length },
+      counts: { d1: latest1D.length, h1: latest1H.length, m5: latest5M.length },
       answer: answerLines.join("\n"),
     });
   } catch (err) {
