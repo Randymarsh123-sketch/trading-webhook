@@ -50,8 +50,14 @@ function formatMsInOslo(ms) {
 }
 
 function getOsloDateKeyFromMs(ms) {
-  // returns "YYYY-MM-DD" in Oslo
   return String(formatMsInOslo(ms)).slice(0, 10);
+}
+
+function getOsloHHMM_fromMs(ms) {
+  const osloStr = formatMsInOslo(ms); // "YYYY-MM-DD HH:mm:ss"
+  const hh = parseInt(osloStr.slice(11, 13), 10);
+  const mm = parseInt(osloStr.slice(14, 16), 10);
+  return { hh, mm, osloStr };
 }
 
 async function fetchTwelveData(interval, outputsize, apiKey) {
@@ -159,12 +165,9 @@ function computeAsiaRange_0200_0659_Oslo(latest5M, nowUtcStr) {
     const ms = parseUtcDatetimeToMs(c.datetime);
     if (ms == null) continue;
 
-    // must be same Oslo date as "today"
     if (getOsloDateKeyFromMs(ms) !== targetOsloDate) continue;
 
-    const osloStr = formatMsInOslo(ms); // "YYYY-MM-DD HH:mm:ss"
-    const hh = parseInt(osloStr.slice(11, 13), 10);
-    const mm = parseInt(osloStr.slice(14, 16), 10);
+    const { hh, mm } = getOsloHHMM_fromMs(ms);
 
     // 02:00–06:59 inclusive
     const afterStart = hh > 2 || (hh === 2 && mm >= 0);
@@ -218,6 +221,89 @@ function computeAsiaRange_0200_0659_Oslo(latest5M, nowUtcStr) {
   };
 }
 
+// ---------------------------
+// DEL2 – First break after 07:00 Oslo
+// Rules:
+// - starting from 07:00 Oslo (same Oslo date), find first 5m candle where:
+//   high > asiaHigh  => UP break (breakPrice = candle.high)
+//   low  < asiaLow   => DOWN break (breakPrice = candle.low)
+// - if both happen in same candle, we choose the one with larger distance beyond level
+// ---------------------------
+function computeAsiaBreakAfter0700_Oslo(latest5M, del2_asiaRange) {
+  if (!del2_asiaRange || !del2_asiaRange.ok) {
+    return { ok: false, reason: "Asia range not available" };
+  }
+  if (!Array.isArray(latest5M) || latest5M.length === 0) {
+    return { ok: false, reason: "No 5M candles" };
+  }
+
+  const targetOsloDate = del2_asiaRange.asiaDateOslo;
+  const asiaHigh = toNum(del2_asiaRange.asiaHigh);
+  const asiaLow = toNum(del2_asiaRange.asiaLow);
+
+  if (!Number.isFinite(asiaHigh) || !Number.isFinite(asiaLow)) {
+    return { ok: false, reason: "Invalid asiaHigh/asiaLow" };
+  }
+
+  const checkedFromOslo = "07:00";
+
+  for (const c of latest5M) {
+    const ms = parseUtcDatetimeToMs(c.datetime);
+    if (ms == null) continue;
+
+    if (getOsloDateKeyFromMs(ms) !== targetOsloDate) continue;
+
+    const { hh, mm, osloStr } = getOsloHHMM_fromMs(ms);
+
+    // only from 07:00 onward
+    const after0700 = hh > 7 || (hh === 7 && mm >= 0);
+    if (!after0700) continue;
+
+    const h = toNum(c.high);
+    const l = toNum(c.low);
+    if (!Number.isFinite(h) || !Number.isFinite(l)) continue;
+
+    const brokeUp = h > asiaHigh;
+    const brokeDown = l < asiaLow;
+
+    if (!brokeUp && !brokeDown) continue;
+
+    // if both in same candle, pick the "stronger" break
+    let breakDirection = "UP";
+    let breakPrice = h;
+
+    if (brokeUp && brokeDown) {
+      const upDist = h - asiaHigh;
+      const downDist = asiaLow - l;
+      if (downDist > upDist) {
+        breakDirection = "DOWN";
+        breakPrice = l;
+      } else {
+        breakDirection = "UP";
+        breakPrice = h;
+      }
+    } else if (brokeDown) {
+      breakDirection = "DOWN";
+      breakPrice = l;
+    }
+
+    return {
+      ok: true,
+      checkedFromOslo,
+      breakDirection,
+      breakPrice,
+      breakTsOslo: osloStr,
+      breakTsUtc: new Date(ms).toISOString(),
+    };
+  }
+
+  return {
+    ok: true,
+    checkedFromOslo,
+    breakDirection: "NONE",
+  };
+}
+
 module.exports = async (req, res) => {
   try {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
@@ -229,7 +315,7 @@ module.exports = async (req, res) => {
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
 
     // IMPORTANT: overwrite Redis completely for 1H/5M to remove old bad timestamps
-    await redis.set("candles:EURUSD:1D", latest1D); // daily is safe too; overwrite for simplicity
+    await redis.set("candles:EURUSD:1D", latest1D);
     await redis.set("candles:EURUSD:1H", latest1H);
     await redis.set("candles:EURUSD:5M", latest5M);
 
@@ -239,8 +325,11 @@ module.exports = async (req, res) => {
     const dailyResult = computeDailyScoreAndBias(latest1D);
     const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
 
-    // DEL2
+    // DEL2 range
     const del2_asiaRange = computeAsiaRange_0200_0659_Oslo(latest5M, nowUtc);
+
+    // DEL2 break after 07:00
+    const del2_asiaBreak = computeAsiaBreakAfter0700_Oslo(latest5M, del2_asiaRange);
 
     const answerLines = [];
     answerLines.push("Basic");
@@ -264,7 +353,7 @@ module.exports = async (req, res) => {
     answerLines.push("London scenario: N/A");
     answerLines.push(`08:00–09:00 candle: ${candle0809}`);
 
-    // Del2 output (for verifisering først)
+    // Del2 output (range)
     answerLines.push("");
     answerLines.push("Del2 - Asia Range (02:00–06:59 Oslo)");
     if (del2_asiaRange.ok) {
@@ -279,18 +368,32 @@ module.exports = async (req, res) => {
       answerLines.push(`N/A: ${del2_asiaRange.reason}`);
     }
 
+    // Del2 output (break)
+    answerLines.push("");
+    answerLines.push("Del2 - Asia Break after 07:00 (Oslo)");
+    if (del2_asiaBreak.ok) {
+      answerLines.push(`Checked from: ${del2_asiaBreak.checkedFromOslo}`);
+      answerLines.push(`Break: ${del2_asiaBreak.breakDirection}`);
+      if (del2_asiaBreak.breakDirection !== "NONE") {
+        answerLines.push(`Break Price: ${del2_asiaBreak.breakPrice}`);
+        answerLines.push(`Break Oslo: ${del2_asiaBreak.breakTsOslo}`);
+        answerLines.push(`Break UTC: ${del2_asiaBreak.breakTsUtc}`);
+      }
+    } else {
+      answerLines.push(`N/A: ${del2_asiaBreak.reason}`);
+    }
+
     return res.status(200).json({
       ok: true,
       timezoneRequestedFromTwelveData: TD_TIMEZONE,
       nowUtc,
       nowOslo,
       counts: { d1: latest1D.length, h1: latest1H.length, m5: latest5M.length },
-
-      // Existing output
       answer: answerLines.join("\n"),
 
-      // New structured output
+      // structured outputs
       del2_asiaRange,
+      del2_asiaBreak,
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
