@@ -6,35 +6,20 @@ const redis = new Redis({
 });
 
 const SYMBOL = "EUR/USD";
-const TD_TIMEZONE = "UTC";
-const OSLO_TZ = "Europe/Oslo";
-
-const del1_dailyBiasPromptBlock = require("../analysis/del1_dailyBias.js");
-const { computeDel2Asia, del2_asiaRangePromptBlock } = require("../analysis/del2_asiaRange.js");
-const { computeDel3Sessions, del3_dailyCyclesPromptBlock } = require("../analysis/del3_dailyCycles.js");
+const TD_TIMEZONE = "UTC"; // force UTC from TwelveData
 
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
-  if (!s) return null;
-
-  if (s.includes(" ")) {
-    const [datePart, timePart] = s.split(" ");
-    const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
-    const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
-    return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
-    return Date.UTC(Y, M - 1, D, 0, 0, 0);
-  }
-
-  return null;
+  if (!s || !s.includes(" ")) return null;
+  const [datePart, timePart] = s.split(" ");
+  const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
+  const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
+  return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
 }
 
 function formatMsInOslo(ms) {
   const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone: OSLO_TZ,
+    timeZone: "Europe/Oslo",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -69,14 +54,7 @@ function toNum(x) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-function computeDailyScoreAndBias(dailyCandles) {
-  if (!Array.isArray(dailyCandles) || dailyCandles.length < 2) {
-    return { ok: false, reason: "Not enough daily candles for D-1/D-2" };
-  }
-
-  const d1 = dailyCandles[dailyCandles.length - 1];
-  const d2 = dailyCandles[dailyCandles.length - 2];
-
+function computeDailyScoreAndBiasFromTwo(d1, d2) {
   const d1High = toNum(d1.high);
   const d1Low = toNum(d1.low);
   const d1Close = toNum(d1.close);
@@ -85,7 +63,9 @@ function computeDailyScoreAndBias(dailyCandles) {
   const d2Low = toNum(d2.low);
 
   const range = d1High - d1Low;
-  if (!Number.isFinite(range) || range <= 0) return { ok: false, reason: "Invalid D-1 range" };
+  if (!Number.isFinite(range) || range <= 0) {
+    return { ok: false, reason: "Invalid D-1 range" };
+  }
 
   const closePos = (d1Close - d1Low) / range;
 
@@ -108,14 +88,49 @@ function computeDailyScoreAndBias(dailyCandles) {
 
   if (strongClose && !insideDay && !overlapRegime) score = 3;
   else {
-    const score2band = (closePos >= 0.55 && closePos < 0.6) || (closePos > 0.4 && closePos <= 0.45);
+    const score2band =
+      (closePos >= 0.55 && closePos < 0.6) || (closePos > 0.4 && closePos <= 0.45);
     if (score2band) score = 2;
     else if (strongClose && (insideDay || overlapRegime)) score = 2;
     else if (!midClose && !overlapRegime && !insideDay) score = 2;
     else score = 1;
   }
 
-  return { ok: true, score, trade: score === 1 ? "No" : "Yes", baseBias };
+  return {
+    ok: true,
+    score,
+    trade: score === 1 ? "No" : "Yes",
+    baseBias,
+    closePos,
+    insideDay,
+    overlapRegime,
+    overlapPct,
+  };
+}
+
+function pickDailyIndexForAsof(dailyCandles, asofDateStr) {
+  // dailyCandles datetime is like "YYYY-MM-DD"
+  // We want the candle whose datetime == asof, else the last candle <= asof.
+  const target = String(asofDateStr || "").trim();
+  if (!target) return { ok: false, reason: "Empty asof" };
+
+  let exactIdx = -1;
+  for (let i = 0; i < dailyCandles.length; i++) {
+    if (String(dailyCandles[i].datetime) === target) {
+      exactIdx = i;
+      break;
+    }
+  }
+  if (exactIdx !== -1) return { ok: true, idx: exactIdx, mode: "exact" };
+
+  // fallback: last <= asof
+  let bestIdx = -1;
+  for (let i = 0; i < dailyCandles.length; i++) {
+    const dt = String(dailyCandles[i].datetime || "");
+    if (dt && dt <= target) bestIdx = i;
+  }
+  if (bestIdx === -1) return { ok: false, reason: `No daily candle <= asof (${target})` };
+  return { ok: true, idx: bestIdx, mode: "fallback_leq" };
 }
 
 function compute0800to0900_fromUTC(m5CandlesLast180) {
@@ -136,27 +151,56 @@ module.exports = async (req, res) => {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
     if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
 
+    const asof = req.query.asof ? String(req.query.asof).trim() : null;
+    if (asof && !/^\d{4}-\d{2}-\d{2}$/.test(asof)) {
+      return res.status(400).json({ error: 'Invalid asof. Use format YYYY-MM-DD, e.g. ?asof=2025-12-12' });
+    }
+
+    // Fetch fresh UTC series
     const latest1D = await fetchTwelveData("1day", 120, twelveKey);
     const latest1H = await fetchTwelveData("1h", 600, twelveKey);
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
 
+    // Overwrite Redis (removes old bad timestamps)
     await redis.set("candles:EURUSD:1D", latest1D);
     await redis.set("candles:EURUSD:1H", latest1H);
     await redis.set("candles:EURUSD:5M", latest5M);
 
+    // Live "now" still based on latest 5m candle (UTC)
     const nowUtc = latest5M.length ? latest5M[latest5M.length - 1].datetime : null;
     const nowOslo = nowUtc ? formatMsInOslo(parseUtcDatetimeToMs(nowUtc)) : null;
 
-    const dailyResult = computeDailyScoreAndBias(latest1D);
-    const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
+    // DAILY BIAS: live mode uses last two candles.
+    // If ?asof=YYYY-MM-DD is set, use that date as D-1 and the previous as D-2.
+    let d1 = null;
+    let d2 = null;
+    let asofMode = null;
 
-    const { del2_asiaRange, del2_asiaBreak } = computeDel2Asia(latest5M, nowUtc);
-    const del3_sessions = computeDel3Sessions(latest5M, nowUtc);
+    if (!asof) {
+      if (latest1D.length < 2) {
+        return res.status(500).json({ error: "Not enough daily candles (need at least 2)" });
+      }
+      d1 = latest1D[latest1D.length - 1];
+      d2 = latest1D[latest1D.length - 2];
+      asofMode = "live";
+    } else {
+      const pick = pickDailyIndexForAsof(latest1D, asof);
+      if (!pick.ok) return res.status(400).json({ error: pick.reason });
+      if (pick.idx < 1) return res.status(400).json({ error: "asof resolves to the first candle; no D-2 available" });
+      d1 = latest1D[pick.idx];
+      d2 = latest1D[pick.idx - 1];
+      asofMode = pick.mode;
+    }
+
+    const dailyResult = computeDailyScoreAndBiasFromTwo(d1, d2);
+
+    const candle0809 = compute0800to0900_fromUTC(latest5M.slice(-180));
 
     const answerLines = [];
     answerLines.push("Basic");
     answerLines.push(`Dato, tid (Oslo): ${nowOslo || "N/A"}`);
     answerLines.push(`Dato, tid (UTC): ${nowUtc || "N/A"}`);
+    if (asof) answerLines.push(`Daily test (asof): ${asof} (${asofMode})`);
     answerLines.push("");
     answerLines.push("Del1 - Daily Bias");
 
@@ -175,93 +219,27 @@ module.exports = async (req, res) => {
     answerLines.push("London scenario: N/A");
     answerLines.push(`08:00–09:00 candle: ${candle0809}`);
 
-    answerLines.push("");
-    answerLines.push("Del2 - Asia Range (02:00–06:59 Oslo)");
-    if (del2_asiaRange.ok) {
-      answerLines.push(`Asia Date (Oslo): ${del2_asiaRange.asiaDateOslo}`);
-      answerLines.push(`Candles: ${del2_asiaRange.candlesCount}`);
-      answerLines.push(`High: ${del2_asiaRange.asiaHigh}`);
-      answerLines.push(`Low: ${del2_asiaRange.asiaLow}`);
-      answerLines.push(`Range: ${del2_asiaRange.asiaRange}`);
-      answerLines.push(`Start Oslo: ${del2_asiaRange.startTsOslo}`);
-      answerLines.push(`End Oslo: ${del2_asiaRange.endTsOslo}`);
-    } else {
-      answerLines.push(`N/A: ${del2_asiaRange.reason}`);
-    }
-
-    answerLines.push("");
-    answerLines.push("Del2 - Asia Break after 07:00 (Oslo)");
-    if (del2_asiaBreak.ok) {
-      answerLines.push(`Checked from: ${del2_asiaBreak.checkedFromOslo}`);
-      answerLines.push(`Break: ${del2_asiaBreak.breakDirection}`);
-      if (del2_asiaBreak.breakDirection !== "NONE") {
-        answerLines.push(`Break Price: ${del2_asiaBreak.breakPrice}`);
-        answerLines.push(`Break Oslo: ${del2_asiaBreak.breakTsOslo}`);
-        answerLines.push(`Break UTC: ${del2_asiaBreak.breakTsUtc}`);
-      }
-    } else {
-      answerLines.push(`N/A: ${del2_asiaBreak.reason}`);
-    }
-
-    answerLines.push("");
-    answerLines.push("Del3 - Session Cycles (v0)");
-    if (del3_sessions.ok) {
-      answerLines.push(`Oslo date: ${del3_sessions.osloDate}`);
-      for (const [k, v] of Object.entries(del3_sessions.sessions)) {
-        if (v && v.ok) {
-          answerLines.push(`${k}: High ${v.high} / Low ${v.low} (candles ${v.candlesCount})`);
-        } else {
-          answerLines.push(`${k}: N/A`);
-        }
-      }
-
-      // NEW: Asia sweep status summary
-      answerLines.push("");
-      answerLines.push("Del3 - Asia Sweep Status (vs Asia High/Low)");
-      const s = del3_sessions.asiaSweepStatus;
-      if (s && s.ok) {
-        answerLines.push(`Asia High: ${s.asiaHigh}`);
-        answerLines.push(`Asia Low: ${s.asiaLow}`);
-        answerLines.push(`First taken: ${s.firstTaken}`);
-
-        if (s.firstEvent) {
-          if (s.firstEvent.type === "BOTH") {
-            answerLines.push(`First event (BOTH): ${s.firstEvent.tsOslo} (UTC ${s.firstEvent.tsUtc})`);
-            answerLines.push(`High price: ${s.firstEvent.highPrice}`);
-            answerLines.push(`Low price: ${s.firstEvent.lowPrice}`);
-          } else {
-            answerLines.push(`First event: ${s.firstEvent.type} in ${s.firstEvent.session}`);
-            answerLines.push(`Time Oslo: ${s.firstEvent.tsOslo}`);
-            answerLines.push(`Time UTC: ${s.firstEvent.tsUtc}`);
-            answerLines.push(`Price: ${s.firstEvent.price}`);
-          }
-        } else {
-          answerLines.push("First event: N/A");
-        }
-      } else {
-        answerLines.push("N/A");
-      }
-    } else {
-      answerLines.push(`N/A: ${del3_sessions.reason}`);
-    }
-
     return res.status(200).json({
       ok: true,
       timezoneRequestedFromTwelveData: TD_TIMEZONE,
       nowUtc,
       nowOslo,
+      asof: asof || null,
       counts: { d1: latest1D.length, h1: latest1H.length, m5: latest5M.length },
+      dailyDebug: dailyResult.ok
+        ? {
+            d1_datetime: d1.datetime,
+            d2_datetime: d2.datetime,
+            close_position: Number(dailyResult.closePos.toFixed(4)),
+            inside_day: dailyResult.insideDay,
+            overlap_regime: dailyResult.overlapRegime,
+            overlap_pct_of_smaller_range: Number(dailyResult.overlapPct.toFixed(4)),
+            score: dailyResult.score,
+            trade: dailyResult.trade,
+            base_bias: dailyResult.baseBias,
+          }
+        : { ok: false, reason: dailyResult.reason },
       answer: answerLines.join("\n"),
-
-      del2_asiaRange,
-      del2_asiaBreak,
-      del3_sessions,
-
-      prompts: {
-        del1_dailyBias: del1_dailyBiasPromptBlock(),
-        del2_asiaRange: del2_asiaRangePromptBlock(),
-        del3_dailyCycles: del3_dailyCyclesPromptBlock(),
-      },
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
