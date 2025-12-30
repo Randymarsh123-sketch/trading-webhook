@@ -9,7 +9,7 @@ const SYMBOL = "EUR/USD";
 const TD_TIMEZONE = "UTC";
 const OSLO_TZ = "Europe/Oslo";
 
-// prompt blocks on root /analysis (NOT inside /api)
+// IMPORTANT: analysis files are now in repo root: /analysis (NOT under /api)
 const del1_dailyBiasPromptBlock = require("../analysis/del1_dailyBias.js");
 const { computeDel2Asia, del2_asiaRangePromptBlock } = require("../analysis/del2_asiaRange.js");
 const { computeDel3Sessions, del3_dailyCyclesPromptBlock } = require("../analysis/del3_dailyCycles.js");
@@ -62,7 +62,7 @@ async function fetchTwelveData(interval, outputsize, apiKey) {
   const res = await fetch(url, { headers: { "Cache-Control": "no-cache" } });
   const data = await res.json();
   if (!data.values) throw new Error("TwelveData response: " + JSON.stringify(data));
-  return data.values.reverse();
+  return data.values.reverse(); // oldest->newest
 }
 
 function toNum(x) {
@@ -70,7 +70,7 @@ function toNum(x) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-// Del1 compute still here for now (Del1 file is prompt-only)
+// NOTE: Del1 compute is still here for now because your del1 file is a prompt block (rules text).
 function computeDailyScoreAndBias(dailyCandles) {
   if (!Array.isArray(dailyCandles) || dailyCandles.length < 2) {
     return { ok: false, reason: "Not enough daily candles for D-1/D-2" };
@@ -138,10 +138,12 @@ module.exports = async (req, res) => {
     const twelveKey = process.env.TWELVEDATA_API_KEY;
     if (!twelveKey) return res.status(500).json({ error: "Missing TWELVEDATA_API_KEY in env" });
 
+    // Fetch fresh UTC series
     const latest1D = await fetchTwelveData("1day", 120, twelveKey);
     const latest1H = await fetchTwelveData("1h", 600, twelveKey);
     const latest5M = await fetchTwelveData("5min", 2500, twelveKey);
 
+    // Overwrite Redis completely
     await redis.set("candles:EURUSD:1D", latest1D);
     await redis.set("candles:EURUSD:1H", latest1H);
     await redis.set("candles:EURUSD:5M", latest5M);
