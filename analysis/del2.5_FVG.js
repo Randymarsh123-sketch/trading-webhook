@@ -1,47 +1,52 @@
 // del2.5_FVG.js
 // DEL 2.5 – HTF POI (FVG)
 //
-// Purpose: Map higher-timeframe Fair Value Gaps (FVG) as POI only.
-// - Detect standard 3-candle FVG on: Daily + 1H
-// - Classify bullish/bearish
-// - Find nearest FVG above/below current price
-// - Measure distance (pips) from current price
-// - Check overlap with Asia High/Low (from Del 2)
+// PURPOSE
+// - Map HTF Fair Value Gaps (FVG) as POI
+// - No bias changes, no entries
 //
-// Update (filled logic):
-// - Prior version removed too many 1H FVGs (too strict).
-// - New rule removes only "clearly spent" FVGs (pro-consensus-ish):
-//   Bullish FVG is removed only if a later candle CLOSES below the lower bound.
-//   Bearish FVG is removed only if a later candle CLOSES above the upper bound.
-//   (Wick-through or partial mitigation does NOT delete the FVG.)
+// FVG DEFINITION
+// - Standard 3-candle inefficiency
+// - Wick-to-wick ONLY
+//
+// RELEVANCE LOGIC
+// 1H:
+// - Freshness: last 96h
+// - Remove if:
+//   a) CLEARLY SPENT (close beyond boundary)
+//   b) FULLY MITIGATED >= 96%
+//
+// Daily:
+// - No freshness limit
+// - Remove if:
+//   a) CLEARLY SPENT
+//   b) FULLY MITIGATED >= 98%
 
 const OSLO_TZ = "Europe/Oslo";
-const PIP_SIZE = 0.0001; // EURUSD
+const PIP_SIZE = 0.0001;
 
-// ---------- time helpers ----------
+// === TUNABLES ===
+const H1_FRESH_MS = 96 * 60 * 60 * 1000;
+const H1_FULLY_MITIGATED = 0.96;
+const D1_FULLY_MITIGATED = 0.98;
+
+// ---------- helpers ----------
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
   if (!s) return null;
-
-  if (s.includes(" ")) {
-    const [datePart, timePart] = s.split(" ");
-    const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
-    const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
-    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
-    return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
-    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
-    return Date.UTC(Y, M - 1, D, 0, 0, 0);
-  }
-
-  return null;
+  const [d, t] = s.split(" ");
+  const [Y, M, D] = d.split("-").map(Number);
+  const [h = 0, m = 0, s2 = 0] = (t || "").split(":").map(Number);
+  return Date.UTC(Y, M - 1, D, h, m, s2);
 }
 
 function formatMsInOslo(ms) {
-  const dtf = new Intl.DateTimeFormat("en-CA", {
+  return new Intl.DateTimeFormat("en-CA", {
     timeZone: OSLO_TZ,
     year: "numeric",
     month: "2-digit",
@@ -50,419 +55,215 @@ function formatMsInOslo(ms) {
     minute: "2-digit",
     second: "2-digit",
     hourCycle: "h23",
-  });
-  const parts = dtf.formatToParts(new Date(ms));
-  const obj = {};
-  for (const p of parts) if (p.type !== "literal") obj[p.type] = p.value;
-  return `${obj.year}-${obj.month}-${obj.day} ${obj.hour}:${obj.minute}:${obj.second}`;
+  }).format(new Date(ms)).replace(",", "");
 }
 
-// ---------- numeric helpers ----------
-function toNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : NaN;
+function pips(diff) {
+  return Math.abs(diff) / PIP_SIZE;
 }
 
-function pipsFromPriceDiff(diff) {
-  const d = Math.abs(Number(diff));
-  if (!Number.isFinite(d)) return null;
-  return d / PIP_SIZE;
-}
-
-// ---------- FVG detection (standard 3-candle inefficiency) ----------
-/**
- * Standard definition:
- * Bullish FVG if candle1.high < candle3.low
- * - Zone: [candle1.high, candle3.low]
- *
- * Bearish FVG if candle1.low > candle3.high
- * - Zone: [candle3.high, candle1.low]
- *
- * We anchor "createdAt" on the middle candle (candle2.datetime) for labeling.
- * Zone is strictly between wicks (high/low), which matches common usage.
- */
-function detectStandardFVGs(candles, tfLabel) {
+// ---------- FVG detection ----------
+function detectFVGs(candles, tf) {
   const out = [];
-  const arr = Array.isArray(candles) ? candles : [];
-  if (arr.length < 3) return out;
-
-  for (let i = 2; i < arr.length; i++) {
-    const c1 = arr[i - 2];
-    const c2 = arr[i - 1];
-    const c3 = arr[i];
+  for (let i = 2; i < candles.length; i++) {
+    const c1 = candles[i - 2];
+    const c2 = candles[i - 1];
+    const c3 = candles[i];
 
     const h1 = toNum(c1.high);
     const l1 = toNum(c1.low);
     const h3 = toNum(c3.high);
     const l3 = toNum(c3.low);
 
-    const t2 = String(c2.datetime || "");
-    const ms2 = parseUtcDatetimeToMs(t2) ?? null;
-
     if (!Number.isFinite(h1) || !Number.isFinite(l1) || !Number.isFinite(h3) || !Number.isFinite(l3)) continue;
+
+    const createdAtMs = parseUtcDatetimeToMs(c2.datetime);
 
     // Bullish FVG
     if (h1 < l3) {
       out.push({
-        tf: tfLabel,
+        tf,
         direction: "BULLISH",
         lower: h1,
         upper: l3,
-        createdAtUtc: t2 || String(c3.datetime || ""),
-        createdAtMs: ms2,
-        iCreated: i - 1, // index of candle2
+        createdAtMs,
+        createdAtUtc: c2.datetime,
+        iCreated: i - 1,
       });
-      continue;
     }
 
     // Bearish FVG
     if (l1 > h3) {
       out.push({
-        tf: tfLabel,
+        tf,
         direction: "BEARISH",
         lower: h3,
         upper: l1,
-        createdAtUtc: t2 || String(c3.datetime || ""),
-        createdAtMs: ms2,
+        createdAtMs,
+        createdAtUtc: c2.datetime,
         iCreated: i - 1,
       });
-      continue;
     }
   }
-
   return out;
 }
 
-/**
- * Mitigation tracking (optional, debug-friendly):
- * - For bullish FVG: how deep price has traded DOWN into the zone after creation.
- * - For bearish FVG: how deep price has traded UP into the zone after creation.
- * Returns { mitigationPct: 0..1 } where 1 means fully traversed.
- *
- * Note: This does NOT decide "filled". It's for reporting/inspection.
- */
-function computeMitigationPctAfterCreation(fvg, candles) {
-  const arr = Array.isArray(candles) ? candles : [];
-  const startIdx = Math.max(0, (fvg?.iCreated ?? 0) + 1);
-
-  const lo = toNum(fvg?.lower);
-  const hi = toNum(fvg?.upper);
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return { mitigationPct: 1 };
-
+// ---------- mitigation ----------
+function mitigationPct(fvg, candles) {
+  const lo = fvg.lower;
+  const hi = fvg.upper;
   const height = hi - lo;
+  if (height <= 0) return 1;
 
-  let deepest = 0; // 0..height
-  for (let i = startIdx; i < arr.length; i++) {
-    const c = arr[i];
-    const h = toNum(c.high);
-    const l = toNum(c.low);
-    if (!Number.isFinite(h) || !Number.isFinite(l)) continue;
+  let deepest = 0;
 
-    if (fvg.direction === "BULLISH") {
-      // How far into the zone did price trade from above? (downward fill)
-      // If low goes below upper, it started filling.
-      if (l < hi) {
-        const fillTo = Math.max(lo, l); // clamp not below lo
-        const amount = hi - fillTo;     // 0..height
-        if (amount > deepest) deepest = amount;
-      }
-    } else if (fvg.direction === "BEARISH") {
-      // How far into the zone did price trade from below? (upward fill)
-      if (h > lo) {
-        const fillTo = Math.min(hi, h); // clamp not above hi
-        const amount = fillTo - lo;     // 0..height
-        if (amount > deepest) deepest = amount;
-      }
+  for (let i = fvg.iCreated + 1; i < candles.length; i++) {
+    const h = toNum(candles[i].high);
+    const l = toNum(candles[i].low);
+
+    if (fvg.direction === "BULLISH" && l < hi) {
+      deepest = Math.max(deepest, hi - Math.max(l, lo));
+    }
+
+    if (fvg.direction === "BEARISH" && h > lo) {
+      deepest = Math.max(deepest, Math.min(h, hi) - lo);
     }
   }
 
-  const pct = height > 0 ? deepest / height : 1;
-  return { mitigationPct: Math.max(0, Math.min(1, pct)) };
+  return Math.min(1, deepest / height);
 }
 
-/**
- * New "clearly filled / spent" logic (less aggressive, closer to common practice):
- *
- * - Bullish FVG (support-type zone):
- *   Consider it "spent" only if a later candle CLOSES <= lower bound.
- *
- * - Bearish FVG (resistance-type zone):
- *   Consider it "spent" only if a later candle CLOSES >= upper bound.
- *
- * This avoids deleting FVGs just because of wick-through/partial mitigation.
- */
-function isFvgClearlySpentAfterCreation(fvg, candles) {
-  const arr = Array.isArray(candles) ? candles : [];
-  const startIdx = Math.max(0, (fvg?.iCreated ?? 0) + 1);
-
-  const lo = toNum(fvg?.lower);
-  const hi = toNum(fvg?.upper);
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return true;
-
-  for (let i = startIdx; i < arr.length; i++) {
-    const c = arr[i];
-    const close = toNum(c.close);
-    if (!Number.isFinite(close)) continue;
-
-    if (fvg.direction === "BULLISH") {
-      if (close <= lo) return true;
-    } else if (fvg.direction === "BEARISH") {
-      if (close >= hi) return true;
-    }
+function isClearlySpent(fvg, candles) {
+  for (let i = fvg.iCreated + 1; i < candles.length; i++) {
+    const c = toNum(candles[i].close);
+    if (fvg.direction === "BULLISH" && c <= fvg.lower) return true;
+    if (fvg.direction === "BEARISH" && c >= fvg.upper) return true;
   }
-
   return false;
 }
 
-/**
- * Freshness rules:
- * - Daily: allow older, but filter out clearly spent zones.
- * - 1H: require recent (default last 48h) AND not clearly spent.
- */
-function filterRelevantFvgs(fvgs, candles, nowMs, opts) {
-  const { requireRecentMs = null } = opts || {};
+// ---------- filtering ----------
+function filterFVGs(fvgs, candles, nowMs, tf) {
+  return fvgs.filter((fvg) => {
+    const mit = mitigationPct(fvg, candles);
+    const cutoff = tf === "1H" ? H1_FULLY_MITIGATED : D1_FULLY_MITIGATED;
 
-  const out = [];
-  for (const fvg of Array.isArray(fvgs) ? fvgs : []) {
-    if (isFvgClearlySpentAfterCreation(fvg, candles)) continue;
+    if (isClearlySpent(fvg, candles)) return false;
+    if (mit >= cutoff) return false;
 
-    if (requireRecentMs != null && Number.isFinite(requireRecentMs)) {
-      const created = Number(fvg.createdAtMs);
-      if (!Number.isFinite(created) || !Number.isFinite(nowMs)) continue;
-      if (nowMs - created > requireRecentMs) continue;
+    if (tf === "1H") {
+      if (nowMs - fvg.createdAtMs > H1_FRESH_MS) return false;
     }
 
-    out.push(fvg);
-  }
-  return out;
+    fvg.mitigationPct = mit;
+    return true;
+  });
 }
 
-// ---------- nearest selection + metrics ----------
-function distancePipsToZone(price, lower, upper) {
-  const p = toNum(price);
-  const lo = toNum(lower);
-  const hi = toNum(upper);
-  if (!Number.isFinite(p) || !Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
-
-  if (p < lo) return pipsFromPriceDiff(lo - p);
-  if (p > hi) return pipsFromPriceDiff(p - hi);
-  return 0;
-}
-
-function zoneRelationToPrice(price, lower, upper) {
-  const p = toNum(price);
-  const lo = toNum(lower);
-  const hi = toNum(upper);
-  if (!Number.isFinite(p) || !Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return "UNKNOWN";
-  if (hi < p) return "BELOW";
-  if (lo > p) return "ABOVE";
+// ---------- nearest logic ----------
+function classifyRelation(price, fvg) {
+  if (price < fvg.lower) return "ABOVE";
+  if (price > fvg.upper) return "BELOW";
   return "CONTAINS";
 }
 
-function overlapsLevel(level, lower, upper, tolPips = 0) {
-  const lvl = toNum(level);
-  const lo = toNum(lower);
-  const hi = toNum(upper);
-  if (!Number.isFinite(lvl) || !Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return false;
-  const tol = (Number(tolPips) || 0) * PIP_SIZE;
-  return lvl >= lo - tol && lvl <= hi + tol;
-}
+function nearestByRelation(fvgs, price, wanted) {
+  let best = null;
+  for (const fvg of fvgs) {
+    const rel = classifyRelation(price, fvg);
+    if (rel !== wanted) continue;
 
-function pickNearestAboveBelow(fvgs, price) {
-  const p = toNum(price);
-  if (!Number.isFinite(p)) return { above: null, below: null, contains: null };
+    const dist =
+      rel === "ABOVE" ? pips(fvg.lower - price) :
+      rel === "BELOW" ? pips(price - fvg.upper) :
+      Math.min(pips(price - fvg.lower), pips(fvg.upper - price));
 
-  let bestAbove = null;
-  let bestBelow = null;
-  let bestContains = null;
-
-  for (const fvg of Array.isArray(fvgs) ? fvgs : []) {
-    const lo = toNum(fvg.lower);
-    const hi = toNum(fvg.upper);
-    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) continue;
-
-    const rel = zoneRelationToPrice(p, lo, hi);
-    const dist = distancePipsToZone(p, lo, hi);
-
-    const candidate = { ...fvg, distancePips: dist, relation: rel };
-
-    if (rel === "ABOVE") {
-      if (!bestAbove || (candidate.distancePips != null && candidate.distancePips < bestAbove.distancePips))
-        bestAbove = candidate;
-    } else if (rel === "BELOW") {
-      if (!bestBelow || (candidate.distancePips != null && candidate.distancePips < bestBelow.distancePips))
-        bestBelow = candidate;
-    } else if (rel === "CONTAINS") {
-      const height = hi - lo;
-      const bestHeight = bestContains ? toNum(bestContains.upper) - toNum(bestContains.lower) : Infinity;
-      if (!bestContains || height < bestHeight) bestContains = candidate;
+    if (!best || dist < best.distancePips) {
+      best = { ...fvg, relation: rel, distancePips: dist };
     }
   }
-
-  return { above: bestAbove, below: bestBelow, contains: bestContains };
+  return best;
 }
 
-// ---------- current price selection ----------
-function pickNowPrice({ latest5M, latest1H, fallback = null }) {
-  if (Array.isArray(latest5M) && latest5M.length) {
-    const last = latest5M[latest5M.length - 1];
-    const c = toNum(last.close);
-    if (Number.isFinite(c)) return c;
-  }
-  if (Array.isArray(latest1H) && latest1H.length) {
-    const last = latest1H[latest1H.length - 1];
-    const c = toNum(last.close);
-    if (Number.isFinite(c)) return c;
-  }
-  const f = toNum(fallback);
-  return Number.isFinite(f) ? f : null;
+function overlaps(level, fvg) {
+  return level >= fvg.lower && level <= fvg.upper;
 }
 
-// ---------- main compute ----------
+// ---------- main ----------
 function computeDel25FVG(latest1H, latest1D, del2_asiaRange, latest5M, nowUtcStr) {
   const nowMs = parseUtcDatetimeToMs(nowUtcStr);
-  if (nowMs == null) return { ok: false, reason: "Invalid nowUtc for FVG module" };
+  const nowPrice = toNum(latest5M?.at(-1)?.close ?? latest1H?.at(-1)?.close);
 
-  const nowPrice = pickNowPrice({ latest5M, latest1H, fallback: null });
-  if (nowPrice == null) return { ok: false, reason: "Cannot determine nowPrice (need close in 5M or 1H)" };
+  const raw1H = detectFVGs(latest1H, "1H");
+  const raw1D = detectFVGs(latest1D, "1D");
 
-  const raw1H = detectStandardFVGs(latest1H, "1H");
-  const raw1D = detectStandardFVGs(latest1D, "1D");
-
-  const H48 = 48 * 60 * 60 * 1000;
-  const rel1H = filterRelevantFvgs(raw1H, latest1H, nowMs, { requireRecentMs: H48 });
-  const rel1D = filterRelevantFvgs(raw1D, latest1D, nowMs, { requireRecentMs: null });
-
-  const near1H = pickNearestAboveBelow(rel1H, nowPrice);
-  const near1D = pickNearestAboveBelow(rel1D, nowPrice);
+  const fvg1H = filterFVGs(raw1H, latest1H, nowMs, "1H");
+  const fvg1D = filterFVGs(raw1D, latest1D, nowMs, "1D");
 
   const asiaHigh = del2_asiaRange?.ok ? toNum(del2_asiaRange.asiaHigh) : NaN;
   const asiaLow = del2_asiaRange?.ok ? toNum(del2_asiaRange.asiaLow) : NaN;
 
-  function decorateNearest(n, candlesForMitigation) {
-    if (!n) return null;
-
-    const mit = computeMitigationPctAfterCreation(n, candlesForMitigation);
-
+  function decorate(fvg) {
+    if (!fvg) return null;
     return {
-      tf: n.tf,
-      direction: n.direction,
-      lower: n.lower,
-      upper: n.upper,
-      createdAtUtc: n.createdAtUtc,
-      createdAtOslo: n.createdAtMs != null ? formatMsInOslo(n.createdAtMs) : null,
-      relationToPrice: n.relation,
-      distancePips: n.distancePips,
-      mitigationPct: Number.isFinite(mit.mitigationPct) ? Number(mit.mitigationPct.toFixed(3)) : null,
-      overlapsAsiaHigh: Number.isFinite(asiaHigh) ? overlapsLevel(asiaHigh, n.lower, n.upper, 0) : null,
-      overlapsAsiaLow: Number.isFinite(asiaLow) ? overlapsLevel(asiaLow, n.lower, n.upper, 0) : null,
+      ...fvg,
+      createdAtOslo: formatMsInOslo(fvg.createdAtMs),
+      overlapsAsiaHigh: Number.isFinite(asiaHigh) ? overlaps(asiaHigh, fvg) : null,
+      overlapsAsiaLow: Number.isFinite(asiaLow) ? overlaps(asiaLow, fvg) : null,
     };
   }
 
-  const map = {
+  const result = {
     ok: true,
-    nowUtc: new Date(nowMs).toISOString(),
     nowOslo: formatMsInOslo(nowMs),
     nowPrice,
-    asia: del2_asiaRange?.ok
-      ? {
-          asiaDateOslo: del2_asiaRange.asiaDateOslo,
-          asiaHigh: del2_asiaRange.asiaHigh,
-          asiaLow: del2_asiaRange.asiaLow,
-          asiaRange: del2_asiaRange.asiaRange,
-          windowOslo: del2_asiaRange.windowOslo,
-        }
-      : { ok: false, reason: "Asia range not available (Del 2)" },
-
     nearest: {
       "1H": {
-        contains: decorateNearest(near1H.contains, latest1H),
-        above: decorateNearest(near1H.above, latest1H),
-        below: decorateNearest(near1H.below, latest1H),
+        contains: decorate(nearestByRelation(fvg1H, nowPrice, "CONTAINS")),
+        above: decorate(nearestByRelation(fvg1H, nowPrice, "ABOVE")),
+        below: decorate(nearestByRelation(fvg1H, nowPrice, "BELOW")),
       },
       "1D": {
-        contains: decorateNearest(near1D.contains, latest1D),
-        above: decorateNearest(near1D.above, latest1D),
-        below: decorateNearest(near1D.below, latest1D),
+        contains: decorate(nearestByRelation(fvg1D, nowPrice, "CONTAINS")),
+        above: decorate(nearestByRelation(fvg1D, nowPrice, "ABOVE")),
+        below: decorate(nearestByRelation(fvg1D, nowPrice, "BELOW")),
       },
-    },
-    counts: {
-      detected: { "1H": raw1H.length, "1D": raw1D.length },
-      relevant: { "1H": rel1H.length, "1D": rel1D.length },
-      note: "Relevant = NOT clearly spent (close beyond boundary). 1H also limited to last 48h.",
     },
   };
 
   const lines = [];
   lines.push(`Now price: ${nowPrice}`);
-  if (map.asia?.ok !== false) {
-    lines.push(`Asia H/L: ${map.asia.asiaHigh} / ${map.asia.asiaLow} (Oslo ${map.asia.windowOslo?.start}-${map.asia.windowOslo?.end})`);
-  } else {
-    lines.push(`Asia H/L: N/A`);
+
+  function line(label, fvg) {
+    if (!fvg) return `${label}: N/A`;
+    return `${label}: ${fvg.tf} ${fvg.direction} [${fvg.lower}–${fvg.upper}] dist ${Math.round(fvg.distancePips)} pips mit ${Math.round(fvg.mitigationPct * 100)}%`;
   }
 
-  function lineForNearest(label, obj) {
-    if (!obj) return `${label}: N/A`;
-    const dist = obj.distancePips == null ? "N/A" : `${Math.round(obj.distancePips)} pips`;
-    const overlapBits = [];
-    if (obj.overlapsAsiaHigh) overlapBits.push("aligns AsiaHigh");
-    if (obj.overlapsAsiaLow) overlapBits.push("aligns AsiaLow");
-    const overlapTxt = overlapBits.length ? ` (${overlapBits.join(", ")})` : "";
-    const mitTxt = obj.mitigationPct == null ? "" : ` mit:${Math.round(obj.mitigationPct * 100)}%`;
-    return `${label}: ${obj.tf} ${obj.direction} [${obj.lower}–${obj.upper}] dist ${dist}${mitTxt}${overlapTxt}`;
-  }
+  lines.push(line("Nearest 1H FVG above/at price", result.nearest["1H"].contains || result.nearest["1H"].above));
+  lines.push(line("Nearest 1H FVG below price", result.nearest["1H"].below));
+  lines.push(line("Nearest Daily FVG above/at price", result.nearest["1D"].contains || result.nearest["1D"].above));
+  lines.push(line("Nearest Daily FVG below price", result.nearest["1D"].below));
 
-  const oneHAbove = map.nearest["1H"].contains || map.nearest["1H"].above;
-  lines.push(lineForNearest("Nearest 1H FVG above/at price", oneHAbove));
-  lines.push(lineForNearest("Nearest 1H FVG below price", map.nearest["1H"].below));
-  lines.push(lineForNearest("Nearest Daily FVG above/at price", map.nearest["1D"].contains || map.nearest["1D"].above));
-  lines.push(lineForNearest("Nearest Daily FVG below price", map.nearest["1D"].below));
-
-  map.reportLines = lines;
-
-  return map;
+  result.reportLines = lines;
+  return result;
 }
 
 function del25_fvgPromptBlock() {
   return `
-DEL 2.5 – HTF POI (FVG) (RULES)
+DEL 2.5 – HTF POI (FVG)
 
-PURPOSE
-- Map higher-timeframe Fair Value Gaps (FVG) as POI only.
-- No bias changes. No entries. Just context.
+- Standard 3-candle FVG (wick-to-wick)
+- Partial mitigation allowed
+- Remove only when:
+  • Close beyond boundary
+  • OR fully mitigated
 
-FVG DEFINITION (standard 3-candle inefficiency; wick-to-wick)
-Bullish FVG:
-- Candle1.high < Candle3.low
-- Zone = [Candle1.high, Candle3.low]
+THRESHOLDS
+- 1H: >= 96% mitigated → ignore
+- Daily: >= 98% mitigated → ignore
+- 1H freshness: last 96 hours
 
-Bearish FVG:
-- Candle1.low > Candle3.high
-- Zone = [Candle3.high, Candle1.low]
-
-RELEVANT FILTER (pro-consensus-ish)
-- Keep FVGs even if partially mitigated (wick touch / partial fill is allowed).
-- Remove ONLY when "clearly spent":
-  - Bullish FVG: later candle CLOSE <= zone.lower
-  - Bearish FVG: later candle CLOSE >= zone.upper
-
-FRESHNESS
-- Daily: no strict age limit (still must be not clearly spent).
-- 1H: last ~48 hours (still must be not clearly spent).
-
-OUTPUT (map only)
-- Current price (now)
-- Nearest FVG above price (Daily + 1H)
-- Nearest FVG below price (Daily + 1H)
-- Direction (bullish/bearish), zone bounds, distance (pips)
-- Mitigation% (0–100, for debug only)
-- Asia overlap checks (from Del2 Asia High/Low):
-  - "Asia High aligns with FVG" = AsiaHigh inside zone
-  - "Asia Low aligns with FVG" = AsiaLow inside zone
-
-STRICT
-- No extra explanations
-- Keep it clean
+Output = context map only (no bias change)
 `.trim();
 }
 
