@@ -1,372 +1,431 @@
-// analysis/del3_dailyCycles.js
-// Del3: Session-cycles + Asia sweep-status (Oslo time)
-//
-// Sessions (Oslo):
-// - Asia: 02:00–06:59
+// del3_dailyCycles.js
+// Daily-Cycle module (Frankfurt + London) for post-09:30 bias/hypothesis.
+// Matches your locked framework:
+// - Asia window: 02:00–06:59 Oslo
+// - Pre-Frankfurt: 07:00–07:59
 // - Frankfurt: 08:00–08:59
-// - London cutoff/fakeout: 09:00–09:30
-// - London main move: 10:00–13:59
+// - London: 09:00–10:00 with decision points 09:30 and 10:00
 //
-// Sweep-status (based on Asia High/Low):
-// - For each later session: did price take Asia High and/or Asia Low?
-// - For each taken: first timestamp (Oslo + UTC) and price
-// - Also overall: which was taken first after Asia ended (HIGH / LOW / BOTH / NONE)
+// Core regimes:
+// 1) Judas (Failure): Frankfurt breaks ONE side and closes back INSIDE Asia.
+//    - Setup1: Frankfurt-only Judas (mini-M inside Frankfurt; failure established early)
+//    - Setup2: Frankfurt -> London Judas (double-session M; London 09:00–09:30 finishes liquidity event)
+// 2) Asia Break-Retest-Continuation: Frankfurt breaks ONE side and closes OUTSIDE Asia in break direction.
+//
+// Pre-Frankfurt (07–08) sweeps are tracked as CONTEXT only.
+//
+// NOTE: Candle timestamps in your CSV are shifted by +1 hour vs Oslo ("1700 means 1600").
+// This module supports a timeShiftMinutes option (default -60) to interpret candle times as Oslo.
 
-const OSLO_TZ = "Europe/Oslo";
+const DEFAULTS = {
+  timeShiftMinutes: -60, // subtract 60 min from candle timestamps to get Oslo
+  // Session windows (Oslo time)
+  windows: {
+    asia: { start: "02:00", end: "06:59" },
+    preFrankfurt: { start: "07:00", end: "07:59" },
+    frankfurt: { start: "08:00", end: "08:59" },
+    londonEarly: { start: "09:00", end: "09:29" },
+    londonLate: { start: "09:30", end: "09:59" },
+  },
 
-function parseUtcDatetimeToMs(dtStr) {
-  const s = String(dtStr || "").trim();
-  if (!s) return null;
+  // Heuristics / thresholds
+  pushDetection: {
+    // For "mini-M" in Frankfurt-only Judas:
+    // count how many times price trades beyond the broken boundary AND closes back inside (rejection).
+    minFailedPushes: 2,
+  },
 
-  if (s.includes(" ")) {
-    const [datePart, timePart] = s.split(" ");
-    const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
-    const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
-    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
-    return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
-  }
+  acceptance: {
+    // "Acceptance" heuristic: >=2 consecutive closes outside Asia boundary in that direction
+    // within the window being evaluated.
+    minConsecutiveCloses: 2,
+  },
 
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
-    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
-    return Date.UTC(Y, M - 1, D, 0, 0, 0);
-  }
+  continuation: {
+    // Continuation confirmation thresholds (pips)
+    // (Used for summary flags only; you can change later.)
+    pipSize: 0.0001,
+    smallExtPips: 10,
+    bigExtPips: 20,
+  },
+};
 
-  return null;
+// ---------- Helpers ----------
+function toDateMs(time) {
+  if (time instanceof Date) return time.getTime();
+  if (typeof time === "number") return time; // assume ms
+  // string
+  const ms = Date.parse(time);
+  if (Number.isNaN(ms)) throw new Error(`Unparseable time: ${time}`);
+  return ms;
 }
 
-function formatMsInOslo(ms) {
-  const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone: OSLO_TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
+function addMinutes(ms, minutes) {
+  return ms + minutes * 60_000;
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+// Create "HH:MM" string in local time for a Date(ms)
+function hhmmLocal(ms) {
+  const d = new Date(ms);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// Compare "HH:MM" lexicographically (works because zero padded)
+function inWindow(hhmm, start, end) {
+  return hhmm >= start && hhmm <= end;
+}
+
+function withinWindow(candleMsOslo, win) {
+  const t = hhmmLocal(candleMsOslo);
+  return inWindow(t, win.start, win.end);
+}
+
+function sliceByWindow(candles, win, timeShiftMinutes) {
+  return candles.filter((c) => {
+    const ms = addMinutes(toDateMs(c.time), timeShiftMinutes);
+    return withinWindow(ms, win);
   });
-  const parts = dtf.formatToParts(new Date(ms));
-  const obj = {};
-  for (const p of parts) if (p.type !== "literal") obj[p.type] = p.value;
-  return `${obj.year}-${obj.month}-${obj.day} ${obj.hour}:${obj.minute}:${obj.second}`;
 }
 
-function getOsloDateKeyFromMs(ms) {
-  return String(formatMsInOslo(ms)).slice(0, 10);
+function lastCandleOfWindow(candles, win, timeShiftMinutes) {
+  const slice = sliceByWindow(candles, win, timeShiftMinutes);
+  if (!slice.length) return null;
+  // candles are expected sorted; if not, sort by time
+  const sorted = [...slice].sort((a, b) => toDateMs(a.time) - toDateMs(b.time));
+  return sorted[sorted.length - 1];
 }
 
-function getOsloHHMM_fromMs(ms) {
-  const osloStr = formatMsInOslo(ms); // "YYYY-MM-DD HH:mm:ss"
-  const hh = parseInt(osloStr.slice(11, 13), 10);
-  const mm = parseInt(osloStr.slice(14, 16), 10);
-  return { hh, mm, osloStr };
+function maxHigh(candles) {
+  return candles.reduce((m, c) => (c.high > m ? c.high : m), -Infinity);
 }
 
-function toNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : NaN;
+function minLow(candles) {
+  return candles.reduce((m, c) => (c.low < m ? c.low : m), Infinity);
 }
 
-function inTimeWindowOslo(hh, mm, startHH, startMM, endHH, endMM, inclusiveEnd) {
-  const afterStart = hh > startHH || (hh === startHH && mm >= startMM);
-  let beforeEnd = hh < endHH || (hh === endHH && mm < endMM);
-  if (inclusiveEnd) beforeEnd = hh < endHH || (hh === endHH && mm <= endMM);
-  return afterStart && beforeEnd;
+function closePosition(close, asiaHigh, asiaLow) {
+  if (close > asiaHigh) return "above";
+  if (close < asiaLow) return "below";
+  return "inside";
 }
 
-function computeSessionStats(latest5M, targetOsloDate, window) {
-  const { name, startHH, startMM, endHH, endMM, inclusiveEnd = true } = window;
+function countConsecutiveClosesOutside(candles, boundary, dir /* "above"|"below" */) {
+  let best = 0;
+  let cur = 0;
+  for (const c of candles) {
+    const ok = dir === "above" ? c.close > boundary : c.close < boundary;
+    if (ok) {
+      cur += 1;
+      best = Math.max(best, cur);
+    } else {
+      cur = 0;
+    }
+  }
+  return best;
+}
 
-  if (!Array.isArray(latest5M) || latest5M.length === 0) {
-    return { ok: false, name, reason: "No 5M candles" };
+// Count failed pushes beyond a boundary where close returns inside (rejection).
+// For bullish boundary (AsiaHigh): push if high > boundary, rejected if close <= boundary.
+// For bearish boundary (AsiaLow): push if low < boundary, rejected if close >= boundary.
+function countFailedPushes(candles, boundary, side /* "high"|"low" */) {
+  let pushes = 0;
+  for (const c of candles) {
+    if (side === "high") {
+      if (c.high > boundary && c.close <= boundary) pushes += 1;
+    } else {
+      if (c.low < boundary && c.close >= boundary) pushes += 1;
+    }
+  }
+  return pushes;
+}
+
+function pipDistance(a, b, pipSize) {
+  return Math.abs(a - b) / pipSize;
+}
+
+// ---------- Core analysis ----------
+function analyzeDailyCycle(input) {
+  const opts = deepMerge(DEFAULTS, input?.options || {});
+  const candles = (input?.candles5m || []).slice().sort((a, b) => toDateMs(a.time) - toDateMs(b.time));
+
+  // Asia values should preferably come from your del2 module.
+  // But if you pass asiaHigh/asiaLow, we use them.
+  const asiaHigh = input?.asia?.high;
+  const asiaLow = input?.asia?.low;
+  const asiaMid = input?.asia?.mid ?? (asiaHigh != null && asiaLow != null ? (asiaHigh + asiaLow) / 2 : null);
+
+  if (asiaHigh == null || asiaLow == null) {
+    throw new Error("del3_dailyCycles.js requires asia.high and asia.low from your del2 Asia module.");
   }
 
-  const rows = [];
+  // Window slices
+  const preF = sliceByWindow(candles, opts.windows.preFrankfurt, opts.timeShiftMinutes);
+  const ff = sliceByWindow(candles, opts.windows.frankfurt, opts.timeShiftMinutes);
+  const ldnE = sliceByWindow(candles, opts.windows.londonEarly, opts.timeShiftMinutes);
+  const ldnL = sliceByWindow(candles, opts.windows.londonLate, opts.timeShiftMinutes);
 
-  for (const c of latest5M) {
-    const ms = parseUtcDatetimeToMs(c.datetime);
-    if (ms == null) continue;
+  const ffCloseCandle = lastCandleOfWindow(candles, opts.windows.frankfurt, opts.timeShiftMinutes);
+  const ffClose = ffCloseCandle?.close ?? null;
 
-    if (getOsloDateKeyFromMs(ms) !== targetOsloDate) continue;
-
-    const { hh, mm, osloStr } = getOsloHHMM_fromMs(ms);
-    if (!inTimeWindowOslo(hh, mm, startHH, startMM, endHH, endMM, inclusiveEnd)) continue;
-
-    const high = toNum(c.high);
-    const low = toNum(c.low);
-    const open = toNum(c.open);
-    const close = toNum(c.close);
-    if (![high, low, open, close].every(Number.isFinite)) continue;
-
-    rows.push({ ms, osloStr, high, low, open, close });
-  }
-
-  if (!rows.length) {
+  // If missing slices (data gaps), return a structured error-like output
+  const dataOk = preF.length && ff.length && (ldnE.length || ldnL.length) && ffClose != null;
+  if (!dataOk) {
     return {
       ok: false,
-      name,
-      reason: "No candles in window",
-      windowOslo: `${String(startHH).padStart(2, "0")}:${String(startMM).padStart(2, "0")}–${String(endHH).padStart(2, "0")}:${String(endMM).padStart(2, "0")}`,
-      candlesCount: 0,
+      reason: "Missing candles for required windows (07–10) or missing Frankfurt close.",
+      debug: {
+        preFrankfurtCount: preF.length,
+        frankfurtCount: ff.length,
+        londonEarlyCount: ldnE.length,
+        londonLateCount: ldnL.length,
+        frankfurtClose: ffClose,
+      },
     };
   }
 
-  rows.sort((a, b) => a.ms - b.ms);
+  // Break checks relative to Asia
+  const preBreakHigh = preF.length ? maxHigh(preF) > asiaHigh : false;
+  const preBreakLow = preF.length ? minLow(preF) < asiaLow : false;
 
-  let hi = -Infinity;
-  let lo = Infinity;
+  const ffBreakHigh = maxHigh(ff) > asiaHigh;
+  const ffBreakLow = minLow(ff) < asiaLow;
 
-  for (const r of rows) {
-    if (r.high > hi) hi = r.high;
-    if (r.low < lo) lo = r.low;
-  }
+  const ffBreakCount = (ffBreakHigh ? 1 : 0) + (ffBreakLow ? 1 : 0);
+  const ffBreakSide =
+    ffBreakCount === 1 ? (ffBreakHigh ? "high" : "low") : ffBreakCount === 2 ? "both" : "none";
 
-  const first = rows[0];
-  const last = rows[rows.length - 1];
+  const ffClosePos = closePosition(ffClose, asiaHigh, asiaLow);
 
-  return {
-    ok: true,
-    name,
-    windowOslo: `${String(startHH).padStart(2, "0")}:${String(startMM).padStart(2, "0")}–${String(endHH).padStart(2, "0")}:${String(endMM).padStart(2, "0")}`,
-    candlesCount: rows.length,
-    open: first.open,
-    close: last.close,
-    high: hi,
-    low: lo,
-    range: hi - lo,
-    startTsOslo: first.osloStr,
-    endTsOslo: last.osloStr,
-    startTsUtc: new Date(first.ms).toISOString(),
-    endTsUtc: new Date(last.ms).toISOString(),
-  };
-}
+  // Regime gate you’ve locked:
+  // Only days where Frankfurt breaks ONE side are considered "in-scope" for your main system.
+  const inScope = ffBreakSide === "high" || ffBreakSide === "low";
 
-// Find first Asia High/Low sweep inside a given window (session)
-function findFirstSweepsInWindow(latest5M, targetOsloDate, window, asiaHigh, asiaLow) {
-  const { name, startHH, startMM, endHH, endMM, inclusiveEnd = true } = window;
+  // Acceptance check in Frankfurt
+  const ffAcceptAbove = countConsecutiveClosesOutside(ff, asiaHigh, "above") >= opts.acceptance.minConsecutiveCloses;
+  const ffAcceptBelow = countConsecutiveClosesOutside(ff, asiaLow, "below") >= opts.acceptance.minConsecutiveCloses;
 
-  let firstHigh = null; // { ms, oslo, utc, price }
-  let firstLow = null;
-
-  for (const c of latest5M) {
-    const ms = parseUtcDatetimeToMs(c.datetime);
-    if (ms == null) continue;
-
-    if (getOsloDateKeyFromMs(ms) !== targetOsloDate) continue;
-
-    const { hh, mm, osloStr } = getOsloHHMM_fromMs(ms);
-    if (!inTimeWindowOslo(hh, mm, startHH, startMM, endHH, endMM, inclusiveEnd)) continue;
-
-    const h = toNum(c.high);
-    const l = toNum(c.low);
-    if (!Number.isFinite(h) || !Number.isFinite(l)) continue;
-
-    if (!firstHigh && h > asiaHigh) {
-      firstHigh = {
-        ms,
-        tsOslo: osloStr,
-        tsUtc: new Date(ms).toISOString(),
-        price: h,
-      };
-    }
-
-    if (!firstLow && l < asiaLow) {
-      firstLow = {
-        ms,
-        tsOslo: osloStr,
-        tsUtc: new Date(ms).toISOString(),
-        price: l,
-      };
-    }
-
-    // If both found, we can stop scanning this window early
-    if (firstHigh && firstLow) break;
-  }
-
-  return {
-    ok: true,
-    name,
-    highTaken: !!firstHigh,
-    lowTaken: !!firstLow,
-    firstHigh,
-    firstLow,
-  };
-}
-
-function computeAsiaSweepStatus(latest5M, targetOsloDate, sessions) {
-  const asia = sessions["Asia"];
-  if (!asia || !asia.ok) {
-    return { ok: false, reason: "Asia session not available" };
-  }
-
-  const asiaHigh = toNum(asia.high);
-  const asiaLow = toNum(asia.low);
-  if (!Number.isFinite(asiaHigh) || !Number.isFinite(asiaLow)) {
-    return { ok: false, reason: "Invalid Asia high/low" };
-  }
-
-  const windowsAfterAsia = [
-    { name: "Frankfurt", startHH: 8, startMM: 0, endHH: 8, endMM: 59, inclusiveEnd: true },
-    { name: "London cutoff/fakeout", startHH: 9, startMM: 0, endHH: 9, endMM: 30, inclusiveEnd: true },
-    { name: "London main move", startHH: 10, startMM: 0, endHH: 13, endMM: 59, inclusiveEnd: true },
-  ];
-
-  const perSession = {};
-  for (const w of windowsAfterAsia) {
-    perSession[w.name] = findFirstSweepsInWindow(latest5M, targetOsloDate, w, asiaHigh, asiaLow);
-  }
-
-  // Determine overall first taken after Asia end (across all windows)
-  let earliestHigh = null; // { session, ...firstHigh }
-  let earliestLow = null;
-
-  for (const [sessionName, r] of Object.entries(perSession)) {
-    if (r && r.firstHigh) {
-      if (!earliestHigh || r.firstHigh.ms < earliestHigh.ms) {
-        earliestHigh = { session: sessionName, ...r.firstHigh };
-      }
-    }
-    if (r && r.firstLow) {
-      if (!earliestLow || r.firstLow.ms < earliestLow.ms) {
-        earliestLow = { session: sessionName, ...r.firstLow };
-      }
+  // Determine regime
+  let regime = "none"; // "failure" | "continuation" | "none"
+  if (inScope) {
+    if (ffClosePos === "inside") regime = "failure";
+    if (ffClosePos === "above" || ffClosePos === "below") {
+      // only treat as continuation if closing outside on the same side as the break
+      if (ffBreakSide === "high" && ffClosePos === "above") regime = "continuation";
+      if (ffBreakSide === "low" && ffClosePos === "below") regime = "continuation";
+      // Otherwise it's "messy" (e.g., breaks high but closes below AsiaLow — rare but possible).
+      if (regime !== "continuation") regime = "none";
     }
   }
 
-  let firstTaken = "NONE";
-  let firstEvent = null;
+  // Setup detection
+  const setups = [];
+  const notes = [];
 
-  if (earliestHigh && earliestLow) {
-    if (earliestHigh.ms === earliestLow.ms) {
-      firstTaken = "BOTH";
-      firstEvent = {
-        type: "BOTH",
-        session: `${earliestHigh.session} & ${earliestLow.session}`,
-        tsOslo: earliestHigh.tsOslo,
-        tsUtc: earliestHigh.tsUtc,
-        highPrice: earliestHigh.price,
-        lowPrice: earliestLow.price,
-      };
-    } else if (earliestHigh.ms < earliestLow.ms) {
-      firstTaken = "HIGH";
-      firstEvent = {
-        type: "HIGH",
-        session: earliestHigh.session,
-        tsOslo: earliestHigh.tsOslo,
-        tsUtc: earliestHigh.tsUtc,
-        price: earliestHigh.price,
-      };
+  // Setup A / Judas family
+  if (regime === "failure") {
+    // Mini-M heuristic = multiple failed pushes in Frankfurt beyond the broken boundary.
+    const boundary = ffBreakSide === "high" ? asiaHigh : asiaLow;
+    const failedPushes = countFailedPushes(ff, boundary, ffBreakSide);
+
+    const isSetup1 = failedPushes >= opts.pushDetection.minFailedPushes;
+    const isSetup2Candidate = !isSetup1; // simple split: if no mini-M, London may complete (double-session)
+
+    // Evaluate London early completion for setup2 candidate:
+    // "last liquidity event (often Frankfurt high/low) without acceptance" + displacement opposite.
+    // We keep this conservative and only label "setup2" if these conditions are clearly met.
+    let setup2Confirmed = false;
+    if (isSetup2Candidate) {
+      const ffExtreme = ffBreakSide === "high" ? maxHigh(ff) : minLow(ff);
+      const ldnEarlyExtreme = ffBreakSide === "high" ? maxHigh(ldnE) : minLow(ldnE);
+
+      const tookFFExtreme = ffBreakSide === "high" ? ldnEarlyExtreme > ffExtreme : ldnEarlyExtreme < ffExtreme;
+
+      // "no acceptance" in the sweep direction during 09:00–09:30
+      const ldnNoAccept =
+        ffBreakSide === "high"
+          ? countConsecutiveClosesOutside(ldnE, ffExtreme, "above") < opts.acceptance.minConsecutiveCloses
+          : countConsecutiveClosesOutside(ldnE, ffExtreme, "below") < opts.acceptance.minConsecutiveCloses;
+
+      // "displacement opposite" heuristic: in London early or late, price moves beyond opposite Asia boundary
+      // OR prints a strong continuation in the opposite direction.
+      const oppositeBoundary = ffBreakSide === "high" ? asiaLow : asiaHigh;
+      const ldnOppBreak =
+        ffBreakSide === "high" ? minLow([...ldnE, ...ldnL]) < oppositeBoundary : maxHigh([...ldnE, ...ldnL]) > oppositeBoundary;
+
+      // Conservative confirm: took FF extreme + no acceptance + some opposite displacement sign
+      if (tookFFExtreme && ldnNoAccept && ldnOppBreak) setup2Confirmed = true;
+    }
+
+    if (isSetup1) {
+      setups.push({
+        id: "JUDAS_SETUP1_FRANKFURT_ONLY",
+        label: "Frankfurt-only Judas (mini-M)",
+        family: "JUDAS",
+        frequencyHint: "12–13%",
+        successHint: "80–90% failure expansion",
+        play: "After 09:30, wait for retrace/mitigation into Frankfurt-origin/Asia levels; trade continuation opposite.",
+      });
+      notes.push(`Frankfurt failed pushes: ${failedPushes} (>= ${opts.pushDetection.minFailedPushes})`);
+    } else if (setup2Confirmed) {
+      setups.push({
+        id: "JUDAS_SETUP2_DOUBLE_SESSION",
+        label: "Frankfurt → London Judas (double-session M)",
+        family: "JUDAS",
+        frequencyHint: "8–9%",
+        successHint: "80–90% failure expansion",
+        play: "London 09:00–09:30 finishes liquidity; after 09:30 wait retrace/mitigation; trade continuation opposite.",
+      });
+      notes.push("London early likely completed the second top/bottom (liquidity event) without acceptance.");
     } else {
-      firstTaken = "LOW";
-      firstEvent = {
-        type: "LOW",
-        session: earliestLow.session,
-        tsOslo: earliestLow.tsOslo,
-        tsUtc: earliestLow.tsUtc,
-        price: earliestLow.price,
-      };
+      // Still failure regime, but not confidently split into setup1/2 by heuristics
+      setups.push({
+        id: "JUDAS_GENERIC_FAILURE",
+        label: "Judas failure (unspecified subtype)",
+        family: "JUDAS",
+        frequencyHint: "20–22% (family)",
+        successHint: "80–90% failure expansion",
+        play: "After 09:30, treat London as a discount window; wait retrace/mitigation and trade continuation opposite.",
+      });
+      notes.push("Failure regime confirmed by Frankfurt close back inside Asia; subtype unclear by heuristic.");
     }
-  } else if (earliestHigh) {
-    firstTaken = "HIGH";
-    firstEvent = {
-      type: "HIGH",
-      session: earliestHigh.session,
-      tsOslo: earliestHigh.tsOslo,
-      tsUtc: earliestHigh.tsUtc,
-      price: earliestHigh.price,
-    };
-  } else if (earliestLow) {
-    firstTaken = "LOW";
-    firstEvent = {
-      type: "LOW",
-      session: earliestLow.session,
-      tsOslo: earliestLow.tsOslo,
-      tsUtc: earliestLow.tsUtc,
-      price: earliestLow.price,
-    };
   }
 
-  const anyHigh = !!earliestHigh;
-  const anyLow = !!earliestLow;
+  // Break–Retest–Continuation
+  if (regime === "continuation") {
+    setups.push({
+      id: "BRC_ASIA_BREAK_RETEST_CONTINUATION",
+      label: "Asia Break → Retest → Continuation",
+      family: "CONTINUATION",
+      frequencyHint: "28–32%",
+      successHint: "75–85% continuation",
+      play: "After 09:30, expect mitigation into Asia breakpoint / Frankfurt range / Frankfurt origin, then continuation in Frankfurt direction.",
+    });
+
+    // Helpful “don’t want to see M” note
+    notes.push("Continuation regime: avoid M/rejection at the extreme; prefer W/absorption at retest.");
+  }
+
+  // No-trade / out-of-scope notes
+  if (!inScope) {
+    if (ffBreakSide === "none") notes.push("Dead Frankfurt (08–09): no Asia side taken.");
+    if (ffBreakSide === "both") notes.push("Frankfurt whipsaw (08–09): both Asia sides taken (messy).");
+  } else if (regime === "none") {
+    notes.push("In-scope break occurred, but Frankfurt close did not align cleanly with break direction (messy day).");
+  }
+
+  // Pre-Frankfurt context (07–08 sweeps)
+  const preContext = {
+    tookAsiaHigh: preBreakHigh,
+    tookAsiaLow: preBreakLow,
+    note:
+      preBreakHigh || preBreakLow
+        ? "Pre-Frankfurt sweeps addressed liquidity; treat as context (may strengthen origin zones), not as trigger."
+        : "No pre-Frankfurt Asia sweep detected.",
+  };
+
+  // Simple “after 10:00” hook: this does NOT generate a new setup day,
+  // it only suggests that if a regime is confirmed, you may look for LVL2/LVL3 pullback-continuation entries.
+  const after10 = {
+    ruleOfThumb:
+      "If nothing with clear structure has happened by 10:00, Europe is done; exception: extensions of confirmed Judas/Continuation via pullback-continuation.",
+    enabledForRegimes: ["failure", "continuation"],
+    timing: "10:00–12:00 (Oslo)",
+    note:
+      "After 10:00 entries are timing tools (e.g., retrace into supply/FVG/EMA cluster) inside an already-confirmed regime, not new setups.",
+  };
+
+  // Compact “09/09:30/10” hypothesis text builders (use in raport.js)
+  const hypothesis = buildHypothesis({
+    inScope,
+    regime,
+    ffBreakSide,
+    ffClosePos,
+    preContext,
+    setups,
+  });
 
   return {
     ok: true,
-    asiaHigh,
-    asiaLow,
-    firstTaken, // HIGH / LOW / BOTH / NONE
-    firstEvent, // details
-    summary: {
-      highTakenAnytime: anyHigh,
-      lowTakenAnytime: anyLow,
-      bothTakenAnytime: anyHigh && anyLow,
+    meta: {
+      asia: { high: asiaHigh, low: asiaLow, mid: asiaMid },
+      preFrankfurt: { tookAsiaHigh: preBreakHigh, tookAsiaLow: preBreakLow },
+      frankfurt: {
+        breakSide: ffBreakSide,
+        breakHigh: ffBreakHigh,
+        breakLow: ffBreakLow,
+        close: ffClose,
+        closePos: ffClosePos,
+        acceptAbove: ffAcceptAbove,
+        acceptBelow: ffAcceptBelow,
+      },
     },
-    perSession,
+    inScope,
+    regime, // "failure" | "continuation" | "none"
+    setups,
+    hypothesis,
+    notes,
+    preContext,
+    after10,
   };
 }
 
-function computeDel3Sessions(latest5M, nowUtcStr) {
-  const nowMs = parseUtcDatetimeToMs(nowUtcStr);
-  if (nowMs == null) return { ok: false, reason: "Invalid nowUtc" };
-
-  const osloDate = getOsloDateKeyFromMs(nowMs);
-
-  const windows = [
-    { name: "Asia", startHH: 2, startMM: 0, endHH: 6, endMM: 59, inclusiveEnd: true },
-    { name: "Frankfurt", startHH: 8, startMM: 0, endHH: 8, endMM: 59, inclusiveEnd: true },
-    { name: "London cutoff/fakeout", startHH: 9, startMM: 0, endHH: 9, endMM: 30, inclusiveEnd: true },
-    { name: "London main move", startHH: 10, startMM: 0, endHH: 13, endMM: 59, inclusiveEnd: true },
-  ];
-
-  const sessions = {};
-  for (const w of windows) {
-    sessions[w.name] = computeSessionStats(latest5M, osloDate, w);
+// ---------- Hypothesis text (for report/prompt use) ----------
+function buildHypothesis({ inScope, regime, ffBreakSide, ffClosePos, preContext, setups }) {
+  if (!inScope) {
+    return {
+      t0900: "No main-system day: Frankfurt did not take exactly one Asia side (dead or whipsaw).",
+      t0930: "No-trade bias: avoid forcing a narrative; wait for NY if anything.",
+      t1000: "No-trade baseline: unless an exceptional clean story emerges, Europe edge is low.",
+    };
   }
 
-  const asiaSweepStatus = computeAsiaSweepStatus(latest5M, osloDate, sessions);
+  if (regime === "failure") {
+    const s = setups[0]?.label || "Judas failure";
+    return {
+      t0900: `Failure regime likely: Frankfurt took Asia ${ffBreakSide} but closed back inside Asia (Judas family). Pre-context: ${preContext.note}`,
+      t0930: `${s}: expect London to offer mitigation/retrace; after 09:30 look for continuation opposite the Frankfurt break.`,
+      t1000:
+        "If no clean mitigation has occurred by 10:00, reduce expectations; only trade extensions if structure remains intact (pullback-continuation).",
+    };
+  }
 
+  if (regime === "continuation") {
+    return {
+      t0900: `Continuation regime likely: Frankfurt broke Asia ${ffBreakSide} and closed outside Asia in that direction. Pre-context: ${preContext.note}`,
+      t0930:
+        "Expect London to price in the Frankfurt impulse via retrace/mitigation into Asia breakpoint / Frankfurt range / origin; continuation in Frankfurt direction typically after 09:30.",
+      t1000:
+        "After 10:00, only look for pullback-continuation (LVL2/LVL3 timing) if Asia is not reclaimed and structure holds.",
+    };
+  }
+
+  // regime none but inScope
   return {
-    ok: true,
-    osloDate,
-    sessions,
-    asiaSweepStatus,
+    t0900: "Messy in-scope day: Frankfurt took one Asia side but close did not align cleanly; treat cautiously.",
+    t0930: "No clear bias: avoid forcing either Judas or continuation story; require extra confirmation or stand down.",
+    t1000: "If unclear by 10:00, Europe edge is low; default to no-trade.",
   };
 }
 
-function del3_dailyCyclesPromptBlock() {
-  return `
-DEL 3 – DAILY CYCLES (SESSION FRAMEWORK + ASIA SWEEP STATUS)
-
-SESSION WINDOWS (Oslo time)
-- Asia: 02:00–06:59
-- Frankfurt: 08:00–08:59
-- London cutoff/fakeout: 09:00–09:30
-- London main move: 10:00–13:59
-
-DATA PER SESSION
-- High / Low / Range
-- Open / Close (first/last 5M candle in the window)
-- Candle count
-- Start/End timestamps (Oslo + UTC)
-
-ASIA SWEEP STATUS (data only)
-- Asia High / Asia Low are taken from the Asia session.
-- Check AFTER Asia ends:
-  - Did price take Asia High?
-  - Did price take Asia Low?
-- For each later session (Frankfurt / cutoff / main move):
-  - first time Asia High is taken (Oslo + UTC) and price
-  - first time Asia Low is taken (Oslo + UTC) and price
-- Also determine which was taken first overall:
-  - HIGH / LOW / BOTH / NONE
-
-STRICT
-- No trade decisions here (yet)
-- Keep it clean
-`.trim();
+// ---------- tiny deep merge ----------
+function deepMerge(a, b) {
+  if (!b) return a;
+  const out = Array.isArray(a) ? [...a] : { ...a };
+  for (const [k, v] of Object.entries(b)) {
+    if (v && typeof v === "object" && !Array.isArray(v) && a?.[k] && typeof a[k] === "object") {
+      out[k] = deepMerge(a[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 module.exports = {
-  computeDel3Sessions,
-  del3_dailyCyclesPromptBlock,
+  analyzeDailyCycle,
+  DEFAULTS,
 };
