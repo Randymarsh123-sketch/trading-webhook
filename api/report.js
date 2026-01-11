@@ -1,66 +1,63 @@
-// /api/report.js — LOCKED v1.2 (single-file “heavy” version)
-// Live mode:
-// - Weekend hard-lock: if Oslo day is Sat/Sun -> pin effectiveNow to LAST FRIDAY candle in 5M feed
-// - marketClosed=true on weekend/stale -> Trade always No
+// report.js
+// v1.2.1 — REN MOTOR (orkestrator) for London 10–14
 //
-// Backtest mode:
-// - Use: ?mode=backtest&asof=YYYY-MM-DD
-// - effectiveNow is set to asof date at 13:55 Oslo (end of payoff window)
-// - Sessions (Asia/FF/London/Payoff) are built from the ASOF day (not Friday-lock)
-// - marketClosed=false in backtest (so Type A/B/C/Overlay can trigger)
+// Files expected in SAME /api folder:
+// - ./daily_bias.js            (computeDailyBias)
+// - ./10_14_biasplays.js       (runBiasPlays)
+// - ./10_14_setups.js          (runSetups)
 //
-// Output contract (top-level):
-// - trade: "Yes"/"No"
-// - bias09: "Bullish"/"Bearish"/"Ranging"
-// - bias10: "Bullish"/"Bearish"/"Ranging"
-// - londonScenario: one of the 5 allowed strings
+// This file:
+// - Fetches EUR/USD candles (1D/1H/5M) from TwelveData in UTC
+// - Applies marketClosed/stale/weekend Friday-lock (LIVE mode)
+// - Supports backtest mode: ?mode=backtest&asof=YYYY-MM-DD
+// - Slices sessions in Oslo time:
+//   Asia: 02:00–06:59
+//   Frankfurt: 07:00–08:59
+//   London setup: 09:00–09:59
+//   Payoff: 10:00–13:55
+// - Calls modules in locked order:
+//   daily_bias → biasplays → setups
+//
+// NOTE: All outputs are deterministic given candle data.
 
-const { Redis } = require("@upstash/redis");
-
-const SYMBOL = "EUR/USD";
-const TZ_REQUEST = "UTC";
 const OSLO_TZ = "Europe/Oslo";
-const PIP = 0.0001;
+const SYMBOL_TD = "EUR/USD";
+const SYMBOL_OUT = "EURUSD";
+const VERSION = "v1.2.1";
 
-const STALE_GAP_MINUTES = 60;
+const { computeDailyBias } = require("./daily_bias");
+const { runBiasPlays } = require("./10_14_biasplays");
+const { runSetups } = require("./10_14_setups");
 
-const redis = new Redis({
-  url: process.env.KV_REST_API_URL,
-  token: process.env.KV_REST_API_TOKEN,
-});
-
-// -------------------------
-// Helpers
-// -------------------------
-function toNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
+// -------------------- Time helpers --------------------
 function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
   if (!s) return null;
 
+  // TwelveData often returns "YYYY-MM-DD HH:MM:SS"
   if (s.includes(" ")) {
     const [datePart, timePart] = s.split(" ");
     const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
     const [hh, mm, ss] = timePart.split(":").map((x) => parseInt(x, 10));
-    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
+    if (![Y, M, D].every(Number.isFinite)) return null;
     return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
   }
 
+  // Or "YYYY-MM-DD"
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
-    if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
+    if (![Y, M, D].every(Number.isFinite)) return null;
     return Date.UTC(Y, M - 1, D, 0, 0, 0);
   }
 
-  return null;
+  // Or ISO
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
 }
 
-function formatMsInTz(ms, timeZone) {
+function formatMsInOslo(ms) {
   const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
+    timeZone: OSLO_TZ,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -75,761 +72,519 @@ function formatMsInTz(ms, timeZone) {
   return `${obj.year}-${obj.month}-${obj.day} ${obj.hour}:${obj.minute}:${obj.second}`;
 }
 
-function getOsloParts(ms) {
-  const s = formatMsInTz(ms, OSLO_TZ);
-  const hh = parseInt(s.slice(11, 13), 10);
-  const mm = parseInt(s.slice(14, 16), 10);
-  return { s, hh, mm, date: s.slice(0, 10) };
+function getOsloDateKeyFromMs(ms) {
+  return formatMsInOslo(ms).slice(0, 10); // YYYY-MM-DD
 }
 
-function isOsloBetween(ms, startHH, startMM, endHH, endMM) {
-  const { hh, mm } = getOsloParts(ms);
-  const afterStart = hh > startHH || (hh === startHH && mm >= startMM);
-  const beforeEnd = hh < endHH || (hh === endHH && mm <= endMM);
-  return afterStart && beforeEnd;
+function getOsloHHMM_fromMs(ms) {
+  const osloStr = formatMsInOslo(ms);
+  return osloStr.slice(11, 16); // HH:MM
 }
 
-function pips(a, b) {
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
-  return Math.abs(a - b) / PIP;
+function getOsloWeekday(ms) {
+  // "Monday".."Sunday"
+  const dtf = new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "long" });
+  return dtf.format(new Date(ms));
 }
 
-function getOsloWeekdayShort(ms) {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "short" }).formatToParts(new Date(ms));
-  return (parts.find((p) => p.type === "weekday")?.value || "").toLowerCase();
+function isWeekendWeekdayName(weekday) {
+  return weekday === "Saturday" || weekday === "Sunday";
 }
 
-function isWeekendOslo(ms) {
-  const wk = getOsloWeekdayShort(ms);
-  return wk === "sat" || wk === "sun";
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
 }
 
-function isWednesdayOslo(ms) {
-  return getOsloWeekdayShort(ms) === "wed";
-}
-
-function weekdayNameOslo(ms) {
-  if (ms == null) return null;
-  return new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "long" }).format(new Date(ms));
-}
-
-function findLastFridayCandleMs(m5Values) {
-  if (!Array.isArray(m5Values) || m5Values.length === 0) return null;
-  let best = null;
-  for (const c of m5Values) {
-    const ms = parseUtcDatetimeToMs(c?.datetime);
-    if (ms == null) continue;
-    const wk = getOsloWeekdayShort(ms);
-    if (wk === "fri") {
-      if (best == null || ms > best) best = ms;
-    }
-  }
-  return best;
-}
-
-// Convert "YYYY-MM-DD" to a UTC ms that corresponds to 13:55 Oslo on that date.
-// We do this deterministically by scanning the 5M candles and picking the last candle
-// that is (a) on that Oslo date and (b) at or before 13:55 Oslo.
-// This avoids DST pitfalls without needing a timezone parser.
-function findBacktestEffectiveMsFromM5(m5Values, asofOsloDate) {
-  if (!Array.isArray(m5Values) || !asofOsloDate) return null;
-
-  let best = null;
-  for (const c of m5Values) {
-    const ms = parseUtcDatetimeToMs(c?.datetime);
-    if (ms == null) continue;
-    const { date, hh, mm } = getOsloParts(ms);
-    if (date !== asofOsloDate) continue;
-
-    const beforeOrAt1355 = hh < 13 || (hh === 13 && mm <= 55);
-    if (!beforeOrAt1355) continue;
-
-    if (best == null || ms > best) best = ms;
-  }
-  return best;
-}
-
-// -------------------------
-// TwelveData fetch
-// -------------------------
-async function tdFetchCandles(interval, outputsize) {
+// -------------------- TwelveData fetch --------------------
+async function tdFetchSeries(interval, outputsize) {
   const apiKey = process.env.TWELVEDATA_API_KEY;
   if (!apiKey) throw new Error("Missing TWELVEDATA_API_KEY");
 
   const url =
-    `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(SYMBOL)}` +
+    "https://api.twelvedata.com/time_series" +
+    `?symbol=${encodeURIComponent(SYMBOL_TD)}` +
     `&interval=${encodeURIComponent(interval)}` +
-    `&outputsize=${outputsize}` +
-    `&timezone=${encodeURIComponent(TZ_REQUEST)}` +
-    `&format=JSON&apikey=${encodeURIComponent(apiKey)}`;
+    `&outputsize=${encodeURIComponent(String(outputsize))}` +
+    `&timezone=UTC` +
+    `&format=JSON` +
+    `&apikey=${encodeURIComponent(apiKey)}`;
 
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`TwelveData HTTP ${r.status} for ${interval}`);
   const j = await r.json();
-  if (!j || !Array.isArray(j.values)) throw new Error(`Bad TwelveData payload for ${interval}`);
-  return { values: j.values, meta: j.meta || null };
-}
 
-// -------------------------
-// Daily bias (v1.2) — ONLY from daily candles D-1 and D-2
-// -------------------------
-function computeBaseDailyBiasFromD1(d1) {
-  const h = toNum(d1?.high);
-  const l = toNum(d1?.low);
-  const c = toNum(d1?.close);
-  if (h == null || l == null || c == null) return { bias: "Ranging", closePos: null, reason: "missing_daily_fields" };
-  const range = h - l;
-  if (!(range > 0)) return { bias: "Ranging", closePos: null, reason: "invalid_daily_range" };
-  const closePos = (c - l) / range;
-  if (closePos >= 0.6) return { bias: "Bullish", closePos, reason: "close_pos>=0.60" };
-  if (closePos <= 0.4) return { bias: "Bearish", closePos, reason: "close_pos<=0.40" };
-  return { bias: "Ranging", closePos, reason: "0.40<close_pos<0.60" };
-}
-
-function getPDH_PDL_fromD1(d1) {
-  const pdh = toNum(d1?.high);
-  const pdl = toNum(d1?.low);
-  return { pdh: Number.isFinite(pdh) ? pdh : null, pdl: Number.isFinite(pdl) ? pdl : null };
-}
-
-function pickD1D2(dailyValues, asof, effectiveNowMs) {
-  if (!Array.isArray(dailyValues) || dailyValues.length < 2) return { d1: null, d2: null, mode: "none" };
-
-  if (asof) {
-    const idx = dailyValues.findIndex((c) => String(c?.datetime || "").startsWith(asof));
-    if (idx >= 0 && dailyValues[idx + 1]) return { d1: dailyValues[idx], d2: dailyValues[idx + 1], mode: "asof" };
-    return { d1: dailyValues[0], d2: dailyValues[1], mode: "asof_not_found_fallback_latest" };
+  if (!r.ok) {
+    throw new Error(`TwelveData HTTP ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
+  }
+  if (j.status && j.status !== "ok") {
+    throw new Error(`TwelveData status=${j.status}: ${JSON.stringify(j).slice(0, 300)}`);
   }
 
-  const osloDate = effectiveNowMs != null ? getOsloParts(effectiveNowMs).date : null;
+  const values = Array.isArray(j.values) ? j.values : [];
+  // TwelveData returns newest-first; reverse for ascending time
+  const candles = values
+    .map((c) => ({
+      datetime: c.datetime,
+      open: toNum(c.open),
+      high: toNum(c.high),
+      low: toNum(c.low),
+      close: toNum(c.close),
+    }))
+    .filter((c) => c.datetime && Number.isFinite(c.high) && Number.isFinite(c.low))
+    .reverse();
 
-  for (let i = 0; i < dailyValues.length; i++) {
-    const dt = String(dailyValues[i]?.datetime || "").slice(0, 10);
-    if (!dt) continue;
-    if (osloDate && dt <= osloDate && dailyValues[i + 1]) {
-      return { d1: dailyValues[i], d2: dailyValues[i + 1], mode: "latest_on_or_before_oslo_date" };
-    }
+  return {
+    meta: j.meta || null,
+    candles,
+  };
+}
+
+// -------------------- Optional Upstash KV write (best-effort) --------------------
+async function kvSetJson(key, valueObj) {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return { ok: false, skipped: true, reason: "KV env missing" };
+
+  try {
+    const r = await fetch(`${url}/set/${encodeURIComponent(key)}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(valueObj),
+    });
+    if (!r.ok) return { ok: false, status: r.status };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
   }
-
-  return { d1: dailyValues[0], d2: dailyValues[1], mode: "fallback_latest" };
 }
 
-// -------------------------
-// Intraday normalization + sessions
-// -------------------------
-function normalizeM5(latest5M, effectiveNowMs) {
-  const rows = [];
-  if (!Array.isArray(latest5M)) return rows;
-
-  for (const c of latest5M) {
-    const ms = parseUtcDatetimeToMs(c.datetime);
-    if (ms == null) continue;
-    if (effectiveNowMs != null && ms > effectiveNowMs) continue;
-
-    const o = toNum(c.open);
-    const h = toNum(c.high);
-    const l = toNum(c.low);
-    const cl = toNum(c.close);
-    if (o == null || h == null || l == null || cl == null) continue;
-
-    rows.push({ ms, open: o, high: h, low: l, close: cl });
-  }
-
-  rows.sort((a, b) => a.ms - b.ms);
-  return rows;
+// -------------------- Session slicing (Oslo time windows) --------------------
+function sliceSessionRows(rowsSameDay, startHHMM, endHHMMInclusive) {
+  // rowsSameDay already has osloHHMM
+  return rowsSameDay.filter((r) => r.osloHHMM >= startHHMM && r.osloHHMM <= endHHMMInclusive);
 }
 
-function sliceByOsloDate(rows, targetOsloDate) {
-  return rows.filter((r) => getOsloParts(r.ms).date === targetOsloDate);
-}
+function statsFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return { ok: false, count: 0 };
 
-function statsOfWindow(rows) {
-  if (!rows.length) return null;
   let high = -Infinity;
   let low = Infinity;
+
   for (const r of rows) {
-    if (r.high > high) high = r.high;
-    if (r.low < low) low = r.low;
+    if (Number.isFinite(r.high) && r.high > high) high = r.high;
+    if (Number.isFinite(r.low) && r.low < low) low = r.low;
   }
-  const first = rows[0];
-  const last = rows[rows.length - 1];
+
+  const open = rows[0].open;
+  const close = rows[rows.length - 1].close;
+
+  const range = Number.isFinite(high) && Number.isFinite(low) ? high - low : null;
+  const rangePips = Number.isFinite(range) ? range / 0.0001 : null;
+
+  const startMs = rows[0].ms;
+  const endMs = rows[rows.length - 1].ms;
+
   return {
+    ok: true,
     count: rows.length,
     high,
     low,
-    rangePips: pips(high, low),
-    open: first.open,
-    close: last.close,
-    startMs: first.ms,
-    endMs: last.ms,
-    startOslo: getOsloParts(first.ms).s,
-    endOslo: getOsloParts(last.ms).s,
+    rangePips,
+    open: Number.isFinite(open) ? open : null,
+    close: Number.isFinite(close) ? close : null,
+    startMs,
+    endMs,
+    startOslo: formatMsInOslo(startMs),
+    endOslo: formatMsInOslo(endMs),
   };
 }
 
-function windowRows(rows, startHH, startMM, endHH, endMM) {
-  return rows.filter((r) => isOsloBetween(r.ms, startHH, startMM, endHH, endMM));
-}
-
-function computeSessions(rowsSameDay) {
-  const asia = windowRows(rowsSameDay, 2, 0, 6, 59);
-  const frankfurt = windowRows(rowsSameDay, 7, 0, 8, 59);
-  const londonSetup = windowRows(rowsSameDay, 9, 0, 9, 59);
-  const payoff = windowRows(rowsSameDay, 10, 0, 13, 59);
+function buildSessions(rowsSameDay) {
+  const asiaRows = sliceSessionRows(rowsSameDay, "02:00", "06:59");
+  const ffRows = sliceSessionRows(rowsSameDay, "07:00", "08:59");
+  const londonRows = sliceSessionRows(rowsSameDay, "09:00", "09:59");
+  const payoffRows = sliceSessionRows(rowsSameDay, "10:00", "13:55");
 
   return {
-    asia: { rows: asia, stats: statsOfWindow(asia) },
-    frankfurt: { rows: frankfurt, stats: statsOfWindow(frankfurt) },
-    londonSetup: { rows: londonSetup, stats: statsOfWindow(londonSetup) },
-    payoff: { rows: payoff, stats: statsOfWindow(payoff) },
+    asia: { rows: asiaRows, stats: statsFromRows(asiaRows) },
+    frankfurt: { rows: ffRows, stats: statsFromRows(ffRows) },
+    londonSetup: { rows: londonRows, stats: statsFromRows(londonRows) },
+    payoff: { rows: payoffRows, stats: statsFromRows(payoffRows) },
   };
 }
 
-// -------------------------
-// Hard filters
-// -------------------------
-function detectWrongSideBreakFirst(rowsSameDay, bias, pdh, pdl) {
-  if (!rowsSameDay.length) return { ok: false, wrongSide: false, reason: "no_rows" };
-  if (bias !== "Bullish" && bias !== "Bearish") return { ok: true, wrongSide: false, reason: "no_directional_bias" };
-  if (!Number.isFinite(pdh) || !Number.isFinite(pdl)) return { ok: false, wrongSide: false, reason: "missing_pdh_pdl" };
-
-  const qual = rowsSameDay.filter((r) => isOsloBetween(r.ms, 2, 0, 9, 59));
-
-  let firstHit = null;
-  for (const r of qual) {
-    if (firstHit) break;
-    if (r.high > pdh) firstHit = "PDH";
-    else if (r.low < pdl) firstHit = "PDL";
-  }
-
-  if (!firstHit) return { ok: true, wrongSide: false, reason: "no_pdh_pdl_break_before_10" };
-
-  if (bias === "Bullish" && firstHit === "PDL") return { ok: true, wrongSide: true, reason: "bullish_but_pdl_broke_first" };
-  if (bias === "Bearish" && firstHit === "PDH") return { ok: true, wrongSide: true, reason: "bearish_but_pdh_broke_first" };
-
-  return { ok: true, wrongSide: false, reason: "bias_side_broke_first_or_only" };
+// -------------------- Daily candle selection --------------------
+function getDailyDateKey(candle) {
+  // TwelveData daily candle datetime is often "YYYY-MM-DD"
+  const s = String(candle?.datetime || "").trim();
+  if (!s) return null;
+  if (s.includes(" ")) return s.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // ISO fallback
+  const ms = parseUtcDatetimeToMs(s);
+  return ms ? new Date(ms).toISOString().slice(0, 10) : null;
 }
 
-function detectNoStructureBefore10(sessions) {
-  const ff = sessions.frankfurt.stats;
-  const ld = sessions.londonSetup.stats;
-  const ffRange = ff?.rangePips ?? 0;
-  const ldRange = ld?.rangePips ?? 0;
-  const combined = ffRange + ldRange;
-  return { noStructure: combined < 8, combinedRangePips: combined };
-}
+function pickD1D2(dailyCandlesAsc, asofDate, osloDateUsed) {
+  // dailyCandlesAsc in ascending time
+  const arr = dailyCandlesAsc || [];
+  if (arr.length < 2) return { ok: false, reason: "not_enough_daily_candles" };
 
-function detectDeepOverlapOrRot(sessions) {
-  const rows = sessions.londonSetup.rows || [];
-  const st = sessions.londonSetup.stats;
-  const rangeP = st?.rangePips ?? 0;
-  if (rows.length < 6) return { messy: false, reason: "not_enough_london_rows" };
-
-  let flips = 0;
-  let prevDir = null;
-  for (const r of rows) {
-    const dir = r.close > r.open ? "UP" : r.close < r.open ? "DOWN" : "FLAT";
-    if (prevDir && dir !== "FLAT" && prevDir !== "FLAT" && dir !== prevDir) flips++;
-    if (dir !== "FLAT") prevDir = dir;
+  const dateTarget = asofDate || osloDateUsed; // we treat these as YYYY-MM-DD
+  const dateTargetStr = String(dateTarget || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateTargetStr)) {
+    return { ok: false, reason: "invalid_target_date", dateTargetStr };
   }
 
-  const messy = rangeP < 6 && flips >= 3;
-  return { messy, londonRangePips: rangeP, flips, reason: messy ? "small_range_many_flips" : "ok" };
-}
-
-// -------------------------
-// Type A / B / C logic
-// -------------------------
-function asiaBreaksPD(bias, sessions, pdh, pdl) {
-  const asia = sessions.asia.rows || [];
-  if (!asia.length) return { broke: false, direction: "NONE", tsMs: null };
-
-  if (bias === "Bullish") {
-    for (const r of asia) if (r.high > pdh) return { broke: true, direction: "UP", tsMs: r.ms };
-  } else if (bias === "Bearish") {
-    for (const r of asia) if (r.low < pdl) return { broke: true, direction: "DOWN", tsMs: r.ms };
+  // find last candle with dateKey <= target
+  let idx = -1;
+  for (let i = 0; i < arr.length; i++) {
+    const dk = getDailyDateKey(arr[i]);
+    if (!dk) continue;
+    if (dk <= dateTargetStr) idx = i;
   }
 
-  return { broke: false, direction: "NONE", tsMs: null };
+  if (idx < 1) return { ok: false, reason: "cannot_find_d1_d2", dateTargetStr };
+
+  return {
+    ok: true,
+    d1: arr[idx],
+    d2: arr[idx - 1],
+    d1Key: getDailyDateKey(arr[idx]),
+    d2Key: getDailyDateKey(arr[idx - 1]),
+  };
 }
 
-function noReclaimAfterAsiaBreak(bias, rowsSameDay, breakMs, pdh, pdl) {
-  if (!breakMs) return false;
-  const until10 = rowsSameDay.filter((r) => r.ms >= breakMs && isOsloBetween(r.ms, 0, 0, 9, 59));
-  if (!until10.length) return true;
-
-  if (bias === "Bullish") {
-    for (const r of until10) if (r.low <= pdh) return false;
-    return true;
-  }
-  if (bias === "Bearish") {
-    for (const r of until10) if (r.high >= pdl) return false;
-    return true;
-  }
-  return false;
+// -------------------- Effective now / marketClosed / Friday-lock --------------------
+function computeLast5mUtc(candles5mAsc) {
+  if (!Array.isArray(candles5mAsc) || candles5mAsc.length === 0) return null;
+  const last = candles5mAsc[candles5mAsc.length - 1];
+  return last?.datetime || null;
 }
 
-function detectSweepOfLevelInWindow(rows, level, side) {
-  if (!rows.length || !Number.isFinite(level)) return { swept: false, sweepMs: null, sweepExtreme: null };
+function detectFridayLockMs(candles5mAsc) {
+  // We "hard-lock" live weekend to the last candle that is Friday (Oslo),
+  // ideally near 23:55 Oslo, but we simply pick the latest candle whose Oslo weekday is Friday.
+  if (!Array.isArray(candles5mAsc) || candles5mAsc.length === 0) return null;
 
-  let swept = false;
-  let sweepMs = null;
-  let extreme = null;
+  let bestMs = null;
+  for (const c of candles5mAsc) {
+    const ms = parseUtcDatetimeToMs(c.datetime);
+    if (ms == null) continue;
+    const wd = getOsloWeekday(ms);
+    if (wd === "Friday") bestMs = ms;
+  }
+  return bestMs;
+}
 
-  if (side === "HIGH") {
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      if (r.high > level) {
-        for (let j = i; j < rows.length; j++) {
-          if (rows[j].close < level) {
-            swept = true;
-            sweepMs = r.ms;
-            extreme = r.high;
-            break;
-          }
-        }
-        if (swept) break;
-      }
+function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }) {
+  const last5mUtc = computeLast5mUtc(candles5mAsc);
+  const last5mMs = parseUtcDatetimeToMs(last5mUtc);
+  const nowServerMs = Date.now();
+
+  let effectiveNowMs = last5mMs;
+  let marketClosed = false;
+
+  const weekdayServerOslo = getOsloWeekday(nowServerMs);
+  const weekendByServer = isWeekendWeekdayName(weekdayServerOslo);
+
+  const weekdayLastCandleOslo = last5mMs ? getOsloWeekday(last5mMs) : null;
+  const weekendByLastCandle = weekdayLastCandleOslo ? isWeekendWeekdayName(weekdayLastCandleOslo) : false;
+
+  // stale gap is measured from server time to last candle time
+  const staleGapMinutes =
+    Number.isFinite(last5mMs) ? Math.max(0, (nowServerMs - last5mMs) / 60000) : null;
+
+  const staleThreshold = Number(staleThresholdMinutes || 60);
+
+  if (mode === "backtest") {
+    // Backtest: effectiveNow is forced to 13:55 Oslo on asof date (or current Oslo date fallback)
+    const asofStr = String(asof || "").trim();
+    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
+
+    // Create a "YYYY-MM-DD 13:55:00" in Oslo, then convert to UTC ms by iterating candles:
+    // simplest and deterministic: pick the last candle whose OsloDate == targetDate and osloHHMM <= 13:55
+    let best = null;
+    for (const c of candles5mAsc) {
+      const ms = parseUtcDatetimeToMs(c.datetime);
+      if (ms == null) continue;
+      if (getOsloDateKeyFromMs(ms) !== targetDate) continue;
+      const hhmm = getOsloHHMM_fromMs(ms);
+      if (hhmm <= "13:55") best = ms;
     }
-  } else {
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      if (r.low < level) {
-        for (let j = i; j < rows.length; j++) {
-          if (rows[j].close > level) {
-            swept = true;
-            sweepMs = r.ms;
-            extreme = r.low;
-            break;
-          }
-        }
-        if (swept) break;
-      }
-    }
-  }
+    effectiveNowMs = best ?? last5mMs;
+    marketClosed = false;
 
-  return { swept, sweepMs, sweepExtreme: extreme };
-}
-
-function typeA_signal(bias, sessions) {
-  const ld = sessions.londonSetup.rows || [];
-  const asiaSt = sessions.asia.stats;
-  const ffSt = sessions.frankfurt.stats;
-  if (!ld.length || !asiaSt || !ffSt) return { ok: false, reason: "missing_sessions" };
-
-  if (bias === "Bullish") {
-    const sweepAsiaLow = detectSweepOfLevelInWindow(ld, asiaSt.low, "LOW");
-    const sweepFfLow = detectSweepOfLevelInWindow(ld, ffSt.low, "LOW");
-    const swept = sweepAsiaLow.swept || sweepFfLow.swept;
-    return { ok: swept, kind: swept ? "sweep_low_then_up" : "none" };
-  }
-
-  if (bias === "Bearish") {
-    const sweepAsiaHigh = detectSweepOfLevelInWindow(ld, asiaSt.high, "HIGH");
-    const sweepFfHigh = detectSweepOfLevelInWindow(ld, ffSt.high, "HIGH");
-    const swept = sweepAsiaHigh.swept || sweepFfHigh.swept;
-    return { ok: swept, kind: swept ? "sweep_high_then_down" : "none" };
-  }
-
-  return { ok: false, reason: "no_directional_bias" };
-}
-
-function typeB_signal(bias, sessions) {
-  const ld = sessions.londonSetup.rows || [];
-  const asiaSt = sessions.asia.stats;
-  const ffSt = sessions.frankfurt.stats;
-  if (!ld.length || !asiaSt || !ffSt) return { ok: false, reason: "missing_sessions" };
-
-  const ldOpen = ld[0].open;
-  const ldClose = ld[ld.length - 1].close;
-
-  if (bias === "Bullish") {
-    const tookLow = ld.some((r) => r.low < asiaSt.low) || ld.some((r) => r.low < ffSt.low);
-    const failedDown = ldClose > ldOpen;
-    return { ok: tookLow && failedDown, kind: tookLow && failedDown ? "london_down_fake_then_up" : "none" };
-  }
-
-  if (bias === "Bearish") {
-    const tookHigh = ld.some((r) => r.high > asiaSt.high) || ld.some((r) => r.high > ffSt.high);
-    const failedUp = ldClose < ldOpen;
-    return { ok: tookHigh && failedUp, kind: tookHigh && failedUp ? "london_up_fake_then_down" : "none" };
-  }
-
-  return { ok: false, reason: "no_directional_bias" };
-}
-
-function typeC_signal(sessions, pdh, pdl) {
-  const asiaSt = sessions.asia.stats;
-  const ff = sessions.frankfurt.rows || [];
-  const ld = sessions.londonSetup.rows || [];
-  if (!asiaSt || !ff.length || !ld.length) return { ok: false, reason: "missing_sessions" };
-
-  const qual = [...sessions.asia.rows, ...sessions.frankfurt.rows, ...sessions.londonSetup.rows];
-  let pdhClosesAbove = 0;
-  let pdlClosesBelow = 0;
-  if (Number.isFinite(pdh)) for (const r of qual) if (r.close > pdh) pdhClosesAbove++;
-  if (Number.isFinite(pdl)) for (const r of qual) if (r.close < pdl) pdlClosesBelow++;
-  const pdHold = pdhClosesAbove >= 2 || pdlClosesBelow >= 2;
-  if (pdHold) return { ok: false, reason: "pd_break_holds_proxy" };
-
-  const ffTestHigh = detectSweepOfLevelInWindow(ff, asiaSt.high, "HIGH").swept;
-  const ffTestLow = detectSweepOfLevelInWindow(ff, asiaSt.low, "LOW").swept;
-
-  let side = null;
-  if (ffTestHigh && !ffTestLow) side = "HIGH";
-  else if (ffTestLow && !ffTestHigh) side = "LOW";
-  else return { ok: false, reason: "no_single_side_test_in_frankfurt" };
-
-  const ldTestSame =
-    side === "HIGH"
-      ? detectSweepOfLevelInWindow(ld, asiaSt.high, "HIGH").swept
-      : detectSweepOfLevelInWindow(ld, asiaSt.low, "LOW").swept;
-
-  if (!ldTestSame) return { ok: false, reason: "no_second_test_in_london" };
-
-  return { ok: true, side, kind: "double_tap_mean_reversion" };
-}
-
-// -------------------------
-// Overlay (non-bias/no-trade)
-// -------------------------
-function detectFrankfurtManip(sessions) {
-  const asia = sessions.asia.stats;
-  const ffRows = sessions.frankfurt.rows || [];
-  const ffSt = sessions.frankfurt.stats;
-  if (!asia || !ffRows.length || !ffSt) return { ok: false, dir: "NONE", reason: "missing_sessions" };
-
-  let breakCloseOver = false;
-  let breakCloseUnder = false;
-  for (const r of ffRows) {
-    if (r.close > asia.high) breakCloseOver = true;
-    if (r.close < asia.low) breakCloseUnder = true;
-  }
-
-  let consecUp = 0;
-  let consecDown = 0;
-  let maxConsecUp = 0;
-  let maxConsecDown = 0;
-  for (const r of ffRows) {
-    const dir = r.close > r.open ? "UP" : r.close < r.open ? "DOWN" : "FLAT";
-    if (dir === "UP") { consecUp++; consecDown = 0; }
-    else if (dir === "DOWN") { consecDown++; consecUp = 0; }
-    else { consecUp = 0; consecDown = 0; }
-    if (consecUp > maxConsecUp) maxConsecUp = consecUp;
-    if (consecDown > maxConsecDown) maxConsecDown = consecDown;
-  }
-
-  const netMovePips = ffSt.rangePips ?? 0;
-
-  let dir = "NONE";
-  let strength = "WEAK";
-
-  if (breakCloseOver && !breakCloseUnder) { dir = "UP"; strength = "STRONG"; }
-  else if (breakCloseUnder && !breakCloseOver) { dir = "DOWN"; strength = "STRONG"; }
-  else if (maxConsecUp >= 3 && netMovePips >= 8) { dir = "UP"; strength = "MED"; }
-  else if (maxConsecDown >= 3 && netMovePips >= 8) { dir = "DOWN"; strength = "MED"; }
-  else return { ok: false, dir: "NONE", reason: "no_clear_frankfurt_manip" };
-
-  return { ok: true, dir, strength, netMovePips };
-}
-
-function detectLondonSweepForOverlay(sessions) {
-  const asia = sessions.asia.stats;
-  const ff = sessions.frankfurt.stats;
-  const ldRows = sessions.londonSetup.rows || [];
-  if (!asia || !ff || !ldRows.length) return { ok: false, reason: "missing_sessions" };
-
-  const sweepFfHigh = detectSweepOfLevelInWindow(ldRows, ff.high, "HIGH");
-  const sweepFfLow = detectSweepOfLevelInWindow(ldRows, ff.low, "LOW");
-
-  const sweepAsiaHigh = detectSweepOfLevelInWindow(ldRows, asia.high, "HIGH");
-  const sweepAsiaLow = detectSweepOfLevelInWindow(ldRows, asia.low, "LOW");
-
-  const mid = (asia.high + asia.low) / 2;
-  const sweepMidHigh = detectSweepOfLevelInWindow(ldRows, mid, "HIGH");
-  const sweepMidLow = detectSweepOfLevelInWindow(ldRows, mid, "LOW");
-
-  if (sweepFfHigh.swept) return { ok: true, swept: "FF_HIGH", side: "HIGH", ...sweepFfHigh, level: ff.high };
-  if (sweepFfLow.swept) return { ok: true, swept: "FF_LOW", side: "LOW", ...sweepFfLow, level: ff.low };
-  if (sweepAsiaHigh.swept) return { ok: true, swept: "ASIA_HIGH", side: "HIGH", ...sweepAsiaHigh, level: asia.high };
-  if (sweepAsiaLow.swept) return { ok: true, swept: "ASIA_LOW", side: "LOW", ...sweepAsiaLow, level: asia.low };
-  if (sweepMidHigh.swept) return { ok: true, swept: "ASIA_MID", side: "HIGH", ...sweepMidHigh, level: mid };
-  if (sweepMidLow.swept) return { ok: true, swept: "ASIA_MID", side: "LOW", ...sweepMidLow, level: mid };
-
-  return { ok: false, reason: "no_clear_sweep_in_09_10" };
-}
-
-function detectReversalMoveAfter10(sessions, targetDir, minPips) {
-  const payoff = sessions.payoff.rows || [];
-  if (!payoff.length) return { ok: false, reason: "no_payoff_rows" };
-
-  const startPrice = payoff[0].open;
-
-  let best = startPrice;
-  for (const r of payoff) {
-    if (targetDir === "UP") {
-      if (r.high > best) best = r.high;
-    } else if (targetDir === "DOWN") {
-      if (r.low < best) best = r.low;
-    }
-  }
-
-  const movePips = pips(startPrice, best);
-  if (movePips == null) return { ok: false, reason: "bad_prices" };
-  return { ok: movePips >= minPips, movePips };
-}
-
-function overlayQuality(ffManip, ldSweep) {
-  if (!ffManip.ok || !ldSweep.ok) return null;
-
-  const sweepIsFf = ldSweep.swept === "FF_HIGH" || ldSweep.swept === "FF_LOW";
-  const sweepIsAsiaExtreme = ldSweep.swept === "ASIA_HIGH" || ldSweep.swept === "ASIA_LOW";
-  const sweepIsMid = ldSweep.swept === "ASIA_MID";
-
-  if (ffManip.strength === "STRONG" && sweepIsFf) return "A";
-  if ((ffManip.strength === "STRONG" || ffManip.strength === "MED") && (sweepIsAsiaExtreme || sweepIsMid)) return "B";
-  return null;
-}
-
-// -------------------------
-// Scenario mapping
-// -------------------------
-const ALLOWED_SCENARIOS = new Set([
-  "slightly up first → then price down",
-  "slightly down first → then price up",
-  "range / back and forth",
-  "double tap → mean reversion",
-  "no trade (messy day)",
-]);
-
-function scenarioForDirectionalTrade(dir) {
-  if (dir === "UP") return "slightly down first → then price up";
-  if (dir === "DOWN") return "slightly up first → then price down";
-  return "no trade (messy day)";
-}
-
-// -------------------------
-// Main classification (v1.2)
-// -------------------------
-function classifyV12({ bias, sessions, rowsSameDay, pdh, pdl, effectiveNowMs, marketClosed }) {
-  if (marketClosed) {
-    return { trade: "No", scenario: "no trade (messy day)", reason: "market_closed_or_stale", type: "NO_TRADE", tags: {} };
-  }
-
-  const wrongSide = detectWrongSideBreakFirst(rowsSameDay, bias, pdh, pdl);
-  const structure = detectNoStructureBefore10(sessions);
-  const messy = detectDeepOverlapOrRot(sessions);
-  const wed = isWednesdayOslo(effectiveNowMs);
-
-  if (wrongSide.ok && wrongSide.wrongSide && wed) {
-    return { trade: "No", scenario: "no trade (messy day)", reason: "wednesday_plus_wrong_side", type: "NO_TRADE", tags: { wrongSide, structure, messy, wed } };
-  }
-  if (wrongSide.ok && wrongSide.wrongSide) {
-    return { trade: "No", scenario: "no trade (messy day)", reason: "wrong_side_breaks_first", type: "NO_TRADE", tags: { wrongSide, structure, messy, wed } };
-  }
-  if (structure.noStructure) {
-    return { trade: "No", scenario: "no trade (messy day)", reason: "no_structure_before_10", type: "NO_TRADE", tags: { wrongSide, structure, messy, wed } };
-  }
-  if (messy.messy) {
-    return { trade: "No", scenario: "no trade (messy day)", reason: "deep_overlap_or_rot_proxy", type: "NO_TRADE", tags: { wrongSide, structure, messy, wed } };
-  }
-
-  if (bias === "Bullish" || bias === "Bearish") {
-    const asiaBreak = asiaBreaksPD(bias, sessions, pdh, pdl);
-
-    if (asiaBreak.broke) {
-      const noReclaim = noReclaimAfterAsiaBreak(bias, rowsSameDay, asiaBreak.tsMs, pdh, pdl);
-      if (noReclaim) {
-        const aSig = typeA_signal(bias, sessions);
-        if (aSig.ok) {
-          const dir = bias === "Bullish" ? "UP" : "DOWN";
-          return { trade: "Yes", scenario: scenarioForDirectionalTrade(dir), reason: "type_a", type: "TYPE_A", tags: { asiaBreak, noReclaim, aSig } };
-        }
-        return { trade: "No", scenario: "no trade (messy day)", reason: "type_a_premises_met_but_no_trigger_09_10", type: "NO_TRADE", tags: { asiaBreak, noReclaim } };
-      }
-      return { trade: "No", scenario: "no trade (messy day)", reason: "asia_break_but_reclaim", type: "NO_TRADE", tags: { asiaBreak } };
-    }
-
-    const bSig = typeB_signal(bias, sessions);
-    if (bSig.ok) {
-      const dir = bias === "Bullish" ? "UP" : "DOWN";
-      return { trade: "Yes", scenario: scenarioForDirectionalTrade(dir), reason: "type_b", type: "TYPE_B", tags: { bSig } };
-    }
-
-    return { trade: "No", scenario: "no trade (messy day)", reason: "bias_day_no_type_a_or_b", type: "NO_TRADE", tags: {} };
-  }
-
-  const cSig = typeC_signal(sessions, pdh, pdl);
-  if (cSig.ok) {
-    return { trade: "Yes", scenario: "double tap → mean reversion", reason: "type_c", type: "TYPE_C", tags: { cSig } };
-  }
-
-  const ffManip = detectFrankfurtManip(sessions);
-  const ldSweep = detectLondonSweepForOverlay(sessions);
-  if (ffManip.ok && ldSweep.ok) {
-    const quality = overlayQuality(ffManip, ldSweep);
-    if (quality === "A" || quality === "B") {
-      const move = detectReversalMoveAfter10(sessions, ffManip.dir, 15);
-      if (move.ok) {
-        return { trade: "Yes", scenario: scenarioForDirectionalTrade(ffManip.dir), reason: "overlay_frankfurt_london", type: `OVERLAY_${quality}`, tags: { ffManip, ldSweep, move } };
-      }
-      return { trade: "No", scenario: "no trade (messy day)", reason: "overlay_present_but_no_payoff_move_15p", type: "NO_TRADE", tags: { ffManip, ldSweep, move } };
-    }
-  }
-
-  return { trade: "No", scenario: "no trade (messy day)", reason: "ranging_day_no_type_c_or_overlay", type: "NO_TRADE", tags: {} };
-}
-
-// -------------------------
-// Output contract
-// -------------------------
-function makeOutput({ trade, bias, scenario }) {
-  const b = ["Bullish", "Bearish", "Ranging"].includes(bias) ? bias : "Ranging";
-  const sc = ALLOWED_SCENARIOS.has(scenario) ? scenario : "no trade (messy day)";
-  return { trade: trade === "Yes" ? "Yes" : "No", bias09: b, bias10: b, londonScenario: sc };
-}
-
-// -------------------------
-// Handler
-// -------------------------
-module.exports = async function handler(req, res) {
-  try {
-    const asof = typeof req.query.asof === "string" ? req.query.asof.trim() : null;
-    const mode = typeof req.query.mode === "string" ? req.query.mode.trim().toLowerCase() : "live";
-    const isBacktest = mode === "backtest";
-
-    if (isBacktest && !asof) {
-      return res.status(400).json({ ok: false, error: "Backtest mode requires ?asof=YYYY-MM-DD" });
-    }
-
-    const [d1Resp, h1Resp, m5Resp] = await Promise.all([
-      tdFetchCandles("1day", 400),
-      tdFetchCandles("1h", 1500),
-      tdFetchCandles("5min", 5000),
-    ]);
-
-    const daily = d1Resp.values;
-    const h1 = h1Resp.values;
-    const m5 = m5Resp.values;
-
-    await Promise.all([
-      redis.set("candles:EURUSD:1D", daily),
-      redis.set("candles:EURUSD:1H", h1),
-      redis.set("candles:EURUSD:5M", m5),
-    ]);
-
-    const last5mUtcStr = String(m5?.[0]?.datetime || "").trim();
-    const last5mMs = parseUtcDatetimeToMs(last5mUtcStr);
-    const serverNowMs = Date.now();
-
-    let gapMinutes = null;
-    if (last5mMs != null) gapMinutes = (serverNowMs - last5mMs) / 60000;
-
-    const weekendByServer = isWeekendOslo(serverNowMs);
-    const weekendByLastCandle = last5mMs != null ? isWeekendOslo(last5mMs) : false;
-    const stale = gapMinutes != null ? gapMinutes > STALE_GAP_MINUTES : true;
-
-    let fridayLockMs = null;
-    if (weekendByServer || weekendByLastCandle) {
-      fridayLockMs = findLastFridayCandleMs(m5);
-    }
-
-    // Determine effectiveNow & marketClosed depending on mode
-    let effectiveNowMs = serverNowMs;
-    let marketClosed = false;
-
-    if (isBacktest) {
-      // Backtest overrides weekend lock and marketClosed.
-      // effectiveNow = last 5M candle on ASOF date at or before 13:55 Oslo
-      const btMs = findBacktestEffectiveMsFromM5(m5, asof);
-      if (btMs == null) {
-        return res.status(400).json({
-          ok: false,
-          error: `Backtest: could not find 5M candles for Oslo date ${asof} (need candles up to 13:55 Oslo).`,
-        });
-      }
-      effectiveNowMs = btMs;
-      marketClosed = false;
-    } else {
-      // Live mode (weekend hard-lock)
-      if (weekendByServer || weekendByLastCandle) {
-        marketClosed = true;
-        if (fridayLockMs != null) effectiveNowMs = fridayLockMs;
-        else if (last5mMs != null) effectiveNowMs = last5mMs;
-      } else if (stale) {
-        marketClosed = true;
-        if (last5mMs != null) effectiveNowMs = last5mMs;
-      }
-    }
-
-    const effectiveNowOslo = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, OSLO_TZ) : null;
-    const effectiveNowUtc = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, "UTC") : null;
-
-    const { d1, d2, mode: dailyPickMode } = pickD1D2(daily, asof, effectiveNowMs);
-    const base = computeBaseDailyBiasFromD1(d1);
-    const bias = base.bias;
-    const { pdh, pdl } = getPDH_PDL_fromD1(d1);
-
-    const m5Rows = normalizeM5(m5, effectiveNowMs);
-    const targetOsloDate = effectiveNowMs != null ? getOsloParts(effectiveNowMs).date : null;
-    const sameDay = targetOsloDate ? sliceByOsloDate(m5Rows, targetOsloDate) : [];
-    const sessions = computeSessions(sameDay);
-
-    const cls = classifyV12({
-      bias,
-      sessions,
-      rowsSameDay: sameDay,
-      pdh,
-      pdl,
-      effectiveNowMs,
-      marketClosed,
-    });
-
-    const out = makeOutput({ trade: cls.trade, bias, scenario: cls.scenario });
-
-    res.status(200).json({
+    return {
       ok: true,
-      version: "v1.2",
-      symbol: "EURUSD",
-      timezoneRequestedFromTwelveData: TZ_REQUEST,
+      mode,
+      last5mUtc,
+      effectiveNowUtc: effectiveNowMs ? new Date(effectiveNowMs).toISOString().replace("T", " ").slice(0, 19) : null,
+      effectiveNowOslo: effectiveNowMs ? formatMsInOslo(effectiveNowMs) : null,
+      staleGapMinutes,
+      staleThresholdMinutes: staleThreshold,
+      weekendByServer,
+      weekendByLastCandle,
+      fridayLockUtc: null,
+      fridayLockOslo: null,
+      marketClosed,
+      usedFridayLock: false,
+    };
+  }
 
-      mode: isBacktest ? "backtest" : "live",
-      last5mUtc: last5mUtcStr || null,
-      effectiveNowUtc,
-      effectiveNowOslo,
-
-      ...out,
-
-      debug: {
-        asofUsed: asof || null,
-        staleGapMinutes: gapMinutes,
-        staleThresholdMinutes: STALE_GAP_MINUTES,
+  // LIVE mode:
+  // If weekend (by server OR by last candle), lock to Friday and mark marketClosed.
+  if (weekendByServer || weekendByLastCandle) {
+    const fridayLockMs = detectFridayLockMs(candles5mAsc);
+    if (fridayLockMs != null) {
+      effectiveNowMs = fridayLockMs;
+      marketClosed = true;
+      return {
+        ok: true,
+        mode: "live",
+        last5mUtc,
+        effectiveNowUtc: new Date(effectiveNowMs).toISOString().replace("T", " ").slice(0, 19),
+        effectiveNowOslo: formatMsInOslo(effectiveNowMs),
+        staleGapMinutes,
+        staleThresholdMinutes: staleThreshold,
         weekendByServer,
         weekendByLastCandle,
-        fridayLockUtc: fridayLockMs != null ? formatMsInTz(fridayLockMs, "UTC") : null,
-        fridayLockOslo: fridayLockMs != null ? formatMsInTz(fridayLockMs, OSLO_TZ) : null,
+        fridayLockUtc: new Date(fridayLockMs).toISOString().replace("T", " ").slice(0, 19),
+        fridayLockOslo: formatMsInOslo(fridayLockMs),
         marketClosed,
-        dailyPickMode,
-        D_1: d1?.datetime || null,
-        D_2: d2?.datetime || null,
-        baseBias: bias,
-        baseBiasClosePos: base.closePos,
-        baseBiasReason: base.reason,
-        PDH: pdh,
-        PDL: pdl,
-        osloDateUsed: targetOsloDate,
-        weekdayOslo: weekdayNameOslo(effectiveNowMs),
-        classification: { type: cls.type, reason: cls.reason },
+        usedFridayLock: true,
+      };
+    }
+    marketClosed = true;
+  }
+
+  // If stale beyond threshold, treat as closed (or at least do not trade)
+  if (staleGapMinutes != null && staleGapMinutes > staleThreshold) {
+    marketClosed = true;
+  }
+
+  return {
+    ok: true,
+    mode: "live",
+    last5mUtc,
+    effectiveNowUtc: effectiveNowMs ? new Date(effectiveNowMs).toISOString().replace("T", " ").slice(0, 19) : null,
+    effectiveNowOslo: effectiveNowMs ? formatMsInOslo(effectiveNowMs) : null,
+    staleGapMinutes,
+    staleThresholdMinutes: staleThreshold,
+    weekendByServer,
+    weekendByLastCandle,
+    fridayLockUtc: null,
+    fridayLockOslo: null,
+    marketClosed,
+    usedFridayLock: false,
+  };
+}
+
+// -------------------- Rows preparation --------------------
+function buildRowsSameDayAsOf(candles5mAsc, effectiveNowMs, osloDateUsed) {
+  const out = [];
+  for (const c of candles5mAsc) {
+    const ms = parseUtcDatetimeToMs(c.datetime);
+    if (ms == null) continue;
+    if (effectiveNowMs != null && ms > effectiveNowMs) continue;
+    if (getOsloDateKeyFromMs(ms) !== osloDateUsed) continue;
+
+    out.push({
+      ms,
+      datetime: c.datetime,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      osloHHMM: getOsloHHMM_fromMs(ms),
+    });
+  }
+  out.sort((a, b) => a.ms - b.ms);
+  return out;
+}
+
+// -------------------- Main handler --------------------
+module.exports = async function handler(req, res) {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const asof = url.searchParams.get("asof"); // YYYY-MM-DD
+    const mode = url.searchParams.get("mode") === "backtest" ? "backtest" : "live";
+
+    // Fetch candles (sizes chosen for safety)
+    const [d1Resp, h1Resp, m5Resp] = await Promise.all([
+      tdFetchSeries("1day", 500),
+      tdFetchSeries("1h", 2000),
+      tdFetchSeries("5min", 5000),
+    ]);
+
+    const dailyCandles = d1Resp.candles;
+    const h1Candles = h1Resp.candles;
+    const m5Candles = m5Resp.candles;
+
+    // Best-effort store (non-blocking for logic correctness)
+    kvSetJson(`candles:${SYMBOL_OUT}:1D`, dailyCandles);
+    kvSetJson(`candles:${SYMBOL_OUT}:1H`, h1Candles);
+    kvSetJson(`candles:${SYMBOL_OUT}:5M`, m5Candles);
+
+    // Effective now
+    const eff = computeEffectiveNow({
+      mode,
+      asof,
+      candles5mAsc: m5Candles,
+      staleThresholdMinutes: 60,
+    });
+
+    const effectiveNowMs = parseUtcDatetimeToMs(eff.effectiveNowUtc);
+    const osloDateUsed =
+      effectiveNowMs != null ? getOsloDateKeyFromMs(effectiveNowMs) : getOsloDateKeyFromMs(Date.now());
+    const weekdayOslo = effectiveNowMs != null ? getOsloWeekday(effectiveNowMs) : getOsloWeekday(Date.now());
+
+    // Build rows for the day AS-OF effectiveNow
+    const rowsSameDay = buildRowsSameDayAsOf(m5Candles, effectiveNowMs, osloDateUsed);
+    const sessions = buildSessions(rowsSameDay);
+
+    // Pick D-1/D-2
+    const pick = pickD1D2(dailyCandles, mode === "backtest" ? asof : null, osloDateUsed);
+    if (!pick.ok) {
+      return res.status(200).json({
+        ok: false,
+        version: VERSION,
+        symbol: SYMBOL_OUT,
+        timezoneRequestedFromTwelveData: "UTC",
+        mode,
+        error: "daily_pick_failed",
+        debug: {
+          asofUsed: mode === "backtest" ? asof : null,
+          osloDateUsed,
+          weekdayOslo,
+          pick,
+          counts: { d1: dailyCandles.length, h1: h1Candles.length, m5: m5Candles.length, m5SameDay: rowsSameDay.length },
+        },
+      });
+    }
+
+    const D_1 = pick.d1;
+    const D_2 = pick.d2;
+
+    // Daily bias computation
+    const daily = computeDailyBias(D_1, D_2);
+    if (!daily.ok) {
+      return res.status(200).json({
+        ok: false,
+        version: VERSION,
+        symbol: SYMBOL_OUT,
+        timezoneRequestedFromTwelveData: "UTC",
+        mode,
+        error: "daily_bias_failed",
+        debug: { daily },
+      });
+    }
+
+    const PDH = toNum(D_1.high);
+    const PDL = toNum(D_1.low);
+
+    const ctx = {
+      pdh: PDH,
+      pdl: PDL,
+      rowsSameDay,
+      weekdayOslo,
+      marketClosed: !!eff.marketClosed,
+    };
+
+    // Run modules in locked order
+    const biasPlay = runBiasPlays(daily, sessions, ctx);
+    let final = biasPlay;
+
+    if (biasPlay.trade !== "Yes") {
+      const setup = runSetups(daily, sessions, ctx);
+      final = setup.trade === "Yes" ? setup : setup; // keep setup response (gives reasons)
+      // If neither gives trade, final remains setup "No" with reasons; that's fine.
+      // But we want bias fields consistent; setup returns them.
+    }
+
+    // Ensure outputs are clean
+    const trade = final.trade === "Yes" ? "Yes" : "No";
+    const bias09 = String(final.bias09 || daily.bias09 || daily.baseBias || "Ranging");
+    const bias10 = String(final.bias10 || daily.bias10 || daily.baseBias || "Ranging");
+    const londonScenario = String(final.londonScenario || "no trade (messy day)");
+
+    // Classification object (simple)
+    const classification =
+      trade === "Yes"
+        ? { type: String(final.play || "SIGNAL"), reason: String(final.reason || "signal") }
+        : { type: "NO_TRADE", reason: String(final.reason || "no_signal") };
+
+    return res.status(200).json({
+      ok: true,
+      version: VERSION,
+      symbol: SYMBOL_OUT,
+      timezoneRequestedFromTwelveData: "UTC",
+      mode,
+
+      last5mUtc: eff.last5mUtc,
+      effectiveNowUtc: eff.effectiveNowUtc,
+      effectiveNowOslo: eff.effectiveNowOslo,
+
+      trade,
+      bias09,
+      bias10,
+      londonScenario,
+
+      debug: {
+        asofUsed: mode === "backtest" ? asof : null,
+        staleGapMinutes: eff.staleGapMinutes,
+        staleThresholdMinutes: eff.staleThresholdMinutes,
+        weekendByServer: eff.weekendByServer,
+        weekendByLastCandle: eff.weekendByLastCandle,
+        usedFridayLock: eff.usedFridayLock,
+        fridayLockUtc: eff.fridayLockUtc,
+        fridayLockOslo: eff.fridayLockOslo,
+        marketClosed: eff.marketClosed,
+
+        D_1: pick.d1Key,
+        D_2: pick.d2Key,
+        baseBias: daily.baseBias,
+        baseBiasClosePos: daily.closePosition,
+        PDH,
+        PDL,
+        osloDateUsed,
+        weekdayOslo,
+
+        classification,
+
         sessionStats: {
           asia: sessions.asia.stats,
           frankfurt: sessions.frankfurt.stats,
           londonSetup: sessions.londonSetup.stats,
           payoff: sessions.payoff.stats,
         },
-        counts: { d1: daily.length, h1: h1.length, m5: m5.length, m5SameDay: sameDay.length },
+
+        counts: {
+          d1: dailyCandles.length,
+          h1: h1Candles.length,
+          m5: m5Candles.length,
+          m5SameDay: rowsSameDay.length,
+        },
+
+        // Module debug for backtest analysis (kept deterministic)
+        moduleDebug: {
+          biasPlay: biasPlay?.debug || null,
+          biasPlayReason: biasPlay?.reason || null,
+          finalPlay: final?.play || null,
+          finalReason: final?.reason || null,
+          finalDebug: final?.debug || null,
+        },
       },
     });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      version: VERSION,
+      symbol: SYMBOL_OUT,
+      error: String(err?.message || err),
+    });
   }
 };
