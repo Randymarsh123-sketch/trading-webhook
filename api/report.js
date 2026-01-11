@@ -1,4 +1,4 @@
-// /api/report.js — LOCKED v1.2 (single-file “heavy” version, weekend/stale-safe)
+// /api/report.js — LOCKED v1.2 (single-file “heavy” version, WEEKEND HARD-LOCK TO FRIDAY)
 // Implements:
 // - Data refresh: TwelveData 1D/1H/5M (timezone=UTC) + overwrite Redis keys
 // - Daily bias (ONLY from D-1 and D-2 daily candles; bias never changes intraday)
@@ -6,9 +6,10 @@
 // - Type A / B / C logic (mechanical, deterministic)
 // - Hard filters (wrong-side first, overlap/rot proxy, no structure before 10, Wed+wrong-side)
 // - Overlay on non-bias/no-trade: Frankfurt-manip + London-sweep + reversal (A/B quality only)
-// - IMPORTANT FIX: Weekend / market-closed / stale-data guard
-//   -> effectiveNow is pinned to the last available 5M candle when market is closed or data is stale,
-//      so we never "invent" Sunday sessions.
+// - IMPORTANT FIXES:
+//   (1) Weekend hard-lock: If Oslo day is Sat/Sun, we pin effectiveNow to the LAST FRIDAY candle in the 5M feed,
+//       so the system never builds Sunday sessions even if the feed provides Sunday timestamps.
+//   (2) Stale guard: If gap between server time and last candle is big, we pin to last candle.
 // Output contract (top-level):
 // - trade: "Yes"/"No"
 // - bias09: "Bullish"/"Bearish"/"Ranging"
@@ -23,7 +24,7 @@ const OSLO_TZ = "Europe/Oslo";
 const PIP = 0.0001;
 
 // If the gap between server time and last 5m candle is bigger than this,
-// we treat the market as closed/stale and pin "effective now" to last candle.
+// we treat the feed as stale and pin effectiveNow to last candle.
 const STALE_GAP_MINUTES = 60;
 
 const redis = new Redis({
@@ -43,7 +44,6 @@ function parseUtcDatetimeToMs(dtStr) {
   const s = String(dtStr || "").trim();
   if (!s) return null;
 
-  // "YYYY-MM-DD HH:MM:SS"
   if (s.includes(" ")) {
     const [datePart, timePart] = s.split(" ");
     const [Y, M, D] = datePart.split("-").map((x) => parseInt(x, 10));
@@ -52,7 +52,6 @@ function parseUtcDatetimeToMs(dtStr) {
     return Date.UTC(Y, M - 1, D, hh || 0, mm || 0, ss || 0);
   }
 
-  // "YYYY-MM-DD"
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const [Y, M, D] = s.split("-").map((x) => parseInt(x, 10));
     if (!Number.isFinite(Y) || !Number.isFinite(M) || !Number.isFinite(D)) return null;
@@ -117,6 +116,23 @@ function weekdayNameOslo(ms) {
   return new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "long" }).format(new Date(ms));
 }
 
+// Find the most recent Friday candle timestamp in the 5M feed (Oslo weekday).
+// m5Values is expected latest-first from TwelveData (but we don't rely on sort).
+function findLastFridayCandleMs(m5Values) {
+  if (!Array.isArray(m5Values) || m5Values.length === 0) return null;
+
+  let best = null;
+  for (const c of m5Values) {
+    const ms = parseUtcDatetimeToMs(c?.datetime);
+    if (ms == null) continue;
+    const wk = getOsloWeekdayShort(ms);
+    if (wk === "fri") {
+      if (best == null || ms > best) best = ms;
+    }
+  }
+  return best;
+}
+
 // -------------------------
 // TwelveData fetch
 // -------------------------
@@ -140,11 +156,6 @@ async function tdFetchCandles(interval, outputsize) {
 
 // -------------------------
 // Daily bias (v1.2) — ONLY from daily candles D-1 and D-2
-// Base daily bias rule:
-// - close_position = (close - low)/(high-low)
-// - >=0.60 => Bullish
-// - <=0.40 => Bearish
-// - else => Ranging
 // -------------------------
 function computeBaseDailyBiasFromD1(d1) {
   const h = toNum(d1?.high);
@@ -167,8 +178,7 @@ function getPDH_PDL_fromD1(d1) {
 
 // Pick D-1/D-2 deterministically.
 // - If asof=YYYY-MM-DD: D-1 = that date, D-2 = next element
-// - Else: pick the latest daily candle whose DATE (UTC) is <= effective Oslo date converted to UTC date key proxy
-//   In practice (and for weekends), this selects the last completed day (e.g., Friday).
+// - Else: pick latest daily candle whose date (YYYY-MM-DD) <= effective Oslo date (string compare)
 function pickD1D2(dailyValues, asof, effectiveNowMs) {
   if (!Array.isArray(dailyValues) || dailyValues.length < 2) return { d1: null, d2: null, mode: "none" };
 
@@ -178,10 +188,8 @@ function pickD1D2(dailyValues, asof, effectiveNowMs) {
     return { d1: dailyValues[0], d2: dailyValues[1], mode: "asof_not_found_fallback_latest" };
   }
 
-  // Use effective Oslo date as anchor (prevents weekend "today" picking issues).
   const osloDate = effectiveNowMs != null ? getOsloParts(effectiveNowMs).date : null;
 
-  // Find first daily candle whose datetime date <= osloDate (string compare works for YYYY-MM-DD)
   for (let i = 0; i < dailyValues.length; i++) {
     const dt = String(dailyValues[i]?.datetime || "").slice(0, 10);
     if (!dt) continue;
@@ -203,7 +211,7 @@ function normalizeM5(latest5M, effectiveNowMs) {
   for (const c of latest5M) {
     const ms = parseUtcDatetimeToMs(c.datetime);
     if (ms == null) continue;
-    if (effectiveNowMs != null && ms > effectiveNowMs) continue; // no lookahead vs effective now
+    if (effectiveNowMs != null && ms > effectiveNowMs) continue;
 
     const o = toNum(c.open);
     const h = toNum(c.high);
@@ -274,7 +282,7 @@ function detectWrongSideBreakFirst(rowsSameDay, bias, pdh, pdl) {
 
   const qual = rowsSameDay.filter((r) => isOsloBetween(r.ms, 2, 0, 9, 59));
 
-  let firstHit = null; // "PDH" or "PDL"
+  let firstHit = null;
   for (const r of qual) {
     if (firstHit) break;
     if (r.high > pdh) firstHit = "PDH";
@@ -348,7 +356,7 @@ function noReclaimAfterAsiaBreak(bias, rowsSameDay, breakMs, pdh, pdl) {
   return false;
 }
 
-function detectSweepOfLevelInWindow(rows, level, side /*"HIGH"|"LOW"*/) {
+function detectSweepOfLevelInWindow(rows, level, side) {
   if (!rows.length || !Number.isFinite(level)) return { swept: false, sweepMs: null, sweepExtreme: null };
 
   let swept = false;
@@ -443,7 +451,6 @@ function typeC_signal(sessions, pdh, pdl) {
   const ld = sessions.londonSetup.rows || [];
   if (!asiaSt || !ff.length || !ld.length) return { ok: false, reason: "missing_sessions" };
 
-  // PD break holds proxy: >=2 closes beyond PDH or PDL from 02–10
   const qual = [...sessions.asia.rows, ...sessions.frankfurt.rows, ...sessions.londonSetup.rows];
   let pdhClosesAbove = 0;
   let pdlClosesBelow = 0;
@@ -472,7 +479,6 @@ function typeC_signal(sessions, pdh, pdl) {
 
 // -------------------------
 // Overlay (non-bias/no-trade)
- // Frankfurt-manip + London-sweep + reversal after 10 in direction of Frankfurt manip
 // -------------------------
 function detectFrankfurtManip(sessions) {
   const asia = sessions.asia.stats;
@@ -511,7 +517,7 @@ function detectFrankfurtManip(sessions) {
   else if (maxConsecDown >= 3 && netMovePips >= 8) { dir = "DOWN"; strength = "MED"; }
   else return { ok: false, dir: "NONE", reason: "no_clear_frankfurt_manip" };
 
-  return { ok: true, dir, strength, breakCloseOver, breakCloseUnder, maxConsecUp, maxConsecDown, netMovePips };
+  return { ok: true, dir, strength, netMovePips };
 }
 
 function detectLondonSweepForOverlay(sessions) {
@@ -540,7 +546,7 @@ function detectLondonSweepForOverlay(sessions) {
   return { ok: false, reason: "no_clear_sweep_in_09_10" };
 }
 
-function detectReversalMoveAfter10(sessions, targetDir /*"UP"|"DOWN"*/, minPips) {
+function detectReversalMoveAfter10(sessions, targetDir, minPips) {
   const payoff = sessions.payoff.rows || [];
   if (!payoff.length) return { ok: false, reason: "no_payoff_rows" };
 
@@ -569,7 +575,7 @@ function overlayQuality(ffManip, ldSweep) {
 
   if (ffManip.strength === "STRONG" && sweepIsFf) return "A";
   if ((ffManip.strength === "STRONG" || ffManip.strength === "MED") && (sweepIsAsiaExtreme || sweepIsMid)) return "B";
-  return null; // C not used
+  return null;
 }
 
 // -------------------------
@@ -583,7 +589,7 @@ const ALLOWED_SCENARIOS = new Set([
   "no trade (messy day)",
 ]);
 
-function scenarioForDirectionalTrade(dir /*"UP"|"DOWN"*/) {
+function scenarioForDirectionalTrade(dir) {
   if (dir === "UP") return "slightly down first → then price up";
   if (dir === "DOWN") return "slightly up first → then price down";
   return "no trade (messy day)";
@@ -593,19 +599,10 @@ function scenarioForDirectionalTrade(dir /*"UP"|"DOWN"*/) {
 // Main classification (v1.2)
 // -------------------------
 function classifyV12({ bias, sessions, rowsSameDay, pdh, pdl, effectiveNowMs, marketClosed }) {
-  // If market is closed/stale, we do not attempt to create a trade.
-  // We still compute and return bias/scenario deterministically.
   if (marketClosed) {
-    return {
-      trade: "No",
-      scenario: "no trade (messy day)",
-      reason: "market_closed_or_stale",
-      type: "NO_TRADE",
-      tags: {},
-    };
+    return { trade: "No", scenario: "no trade (messy day)", reason: "market_closed_or_stale", type: "NO_TRADE", tags: {} };
   }
 
-  // Hard filters
   const wrongSide = detectWrongSideBreakFirst(rowsSameDay, bias, pdh, pdl);
   const structure = detectNoStructureBefore10(sessions);
   const messy = detectDeepOverlapOrRot(sessions);
@@ -624,7 +621,6 @@ function classifyV12({ bias, sessions, rowsSameDay, pdh, pdl, effectiveNowMs, ma
     return { trade: "No", scenario: "no trade (messy day)", reason: "deep_overlap_or_rot_proxy", type: "NO_TRADE", tags: { wrongSide, structure, messy, wed } };
   }
 
-  // Core system
   if (bias === "Bullish" || bias === "Bearish") {
     const asiaBreak = asiaBreaksPD(bias, sessions, pdh, pdl);
 
@@ -634,29 +630,27 @@ function classifyV12({ bias, sessions, rowsSameDay, pdh, pdl, effectiveNowMs, ma
         const aSig = typeA_signal(bias, sessions);
         if (aSig.ok) {
           const dir = bias === "Bullish" ? "UP" : "DOWN";
-          return { trade: "Yes", scenario: scenarioForDirectionalTrade(dir), reason: "type_a", type: "TYPE_A", tags: { asiaBreak, noReclaim, aSig, wrongSide, structure, messy, wed } };
+          return { trade: "Yes", scenario: scenarioForDirectionalTrade(dir), reason: "type_a", type: "TYPE_A", tags: { asiaBreak, noReclaim, aSig } };
         }
-        return { trade: "No", scenario: "no trade (messy day)", reason: "type_a_premises_met_but_no_trigger_09_10", type: "NO_TRADE", tags: { asiaBreak, noReclaim, wrongSide, structure, messy, wed } };
+        return { trade: "No", scenario: "no trade (messy day)", reason: "type_a_premises_met_but_no_trigger_09_10", type: "NO_TRADE", tags: { asiaBreak, noReclaim } };
       }
-      return { trade: "No", scenario: "no trade (messy day)", reason: "asia_break_but_reclaim", type: "NO_TRADE", tags: { asiaBreak, wrongSide, structure, messy, wed } };
+      return { trade: "No", scenario: "no trade (messy day)", reason: "asia_break_but_reclaim", type: "NO_TRADE", tags: { asiaBreak } };
     }
 
     const bSig = typeB_signal(bias, sessions);
     if (bSig.ok) {
       const dir = bias === "Bullish" ? "UP" : "DOWN";
-      return { trade: "Yes", scenario: scenarioForDirectionalTrade(dir), reason: "type_b", type: "TYPE_B", tags: { bSig, wrongSide, structure, messy, wed } };
+      return { trade: "Yes", scenario: scenarioForDirectionalTrade(dir), reason: "type_b", type: "TYPE_B", tags: { bSig } };
     }
 
-    return { trade: "No", scenario: "no trade (messy day)", reason: "bias_day_no_type_a_or_b", type: "NO_TRADE", tags: { wrongSide, structure, messy, wed } };
+    return { trade: "No", scenario: "no trade (messy day)", reason: "bias_day_no_type_a_or_b", type: "NO_TRADE", tags: {} };
   }
 
-  // No-bias => Type C
   const cSig = typeC_signal(sessions, pdh, pdl);
   if (cSig.ok) {
     return { trade: "Yes", scenario: "double tap → mean reversion", reason: "type_c", type: "TYPE_C", tags: { cSig } };
   }
 
-  // Overlay A/B
   const ffManip = detectFrankfurtManip(sessions);
   const ldSweep = detectLondonSweepForOverlay(sessions);
   if (ffManip.ok && ldSweep.ok) {
@@ -664,13 +658,13 @@ function classifyV12({ bias, sessions, rowsSameDay, pdh, pdl, effectiveNowMs, ma
     if (quality === "A" || quality === "B") {
       const move = detectReversalMoveAfter10(sessions, ffManip.dir, 15);
       if (move.ok) {
-        return { trade: "Yes", scenario: scenarioForDirectionalTrade(ffManip.dir), reason: "overlay_frankfurt_london", type: `OVERLAY_${quality}`, tags: { ffManip, ldSweep, quality, move } };
+        return { trade: "Yes", scenario: scenarioForDirectionalTrade(ffManip.dir), reason: "overlay_frankfurt_london", type: `OVERLAY_${quality}`, tags: { ffManip, ldSweep, move } };
       }
-      return { trade: "No", scenario: "no trade (messy day)", reason: "overlay_present_but_no_payoff_move_15p", type: "NO_TRADE", tags: { ffManip, ldSweep, quality, move } };
+      return { trade: "No", scenario: "no trade (messy day)", reason: "overlay_present_but_no_payoff_move_15p", type: "NO_TRADE", tags: { ffManip, ldSweep, move } };
     }
   }
 
-  return { trade: "No", scenario: "no trade (messy day)", reason: "ranging_day_no_type_c_or_overlay", type: "NO_TRADE", tags: { ffManip, ldSweep } };
+  return { trade: "No", scenario: "no trade (messy day)", reason: "ranging_day_no_type_c_or_overlay", type: "NO_TRADE", tags: {} };
 }
 
 // -------------------------
@@ -679,12 +673,7 @@ function classifyV12({ bias, sessions, rowsSameDay, pdh, pdl, effectiveNowMs, ma
 function makeOutput({ trade, bias, scenario }) {
   const b = ["Bullish", "Bearish", "Ranging"].includes(bias) ? bias : "Ranging";
   const sc = ALLOWED_SCENARIOS.has(scenario) ? scenario : "no trade (messy day)";
-  return {
-    trade: trade === "Yes" ? "Yes" : "No",
-    bias09: b,
-    bias10: b,
-    londonScenario: sc,
-  };
+  return { trade: trade === "Yes" ? "Yes" : "No", bias09: b, bias10: b, londonScenario: sc };
 }
 
 // -------------------------
@@ -704,46 +693,56 @@ module.exports = async function handler(req, res) {
     const h1 = h1Resp.values;
     const m5 = m5Resp.values;
 
-    // Store (overwrite)
     await Promise.all([
       redis.set("candles:EURUSD:1D", daily),
       redis.set("candles:EURUSD:1H", h1),
       redis.set("candles:EURUSD:5M", m5),
     ]);
 
-    // last available 5m candle
     const last5mUtcStr = String(m5?.[0]?.datetime || "").trim();
     const last5mMs = parseUtcDatetimeToMs(last5mUtcStr);
-
-    // server time
     const serverNowMs = Date.now();
 
-    // detect stale / weekend
     let gapMinutes = null;
     if (last5mMs != null) gapMinutes = (serverNowMs - last5mMs) / 60000;
 
     const weekendByServer = isWeekendOslo(serverNowMs);
-    const weekendByLast = last5mMs != null ? isWeekendOslo(last5mMs) : false;
+    const weekendByLastCandle = last5mMs != null ? isWeekendOslo(last5mMs) : false;
 
     const stale = gapMinutes != null ? gapMinutes > STALE_GAP_MINUTES : true;
-    const marketClosed = stale || weekendByServer || weekendByLast;
 
-    // effective now
-    // If market closed/stale: pin to last candle time (so no fake Sunday sessions).
-    // Else: use server time.
-    const effectiveNowMs = marketClosed && last5mMs != null ? last5mMs : serverNowMs;
+    // WEEKEND HARD-LOCK:
+    // If it's weekend (server or last candle), pin effectiveNow to LAST FRIDAY candle in the feed.
+    let fridayLockMs = null;
+    if (weekendByServer || weekendByLastCandle) {
+      fridayLockMs = findLastFridayCandleMs(m5);
+    }
 
-    const nowOslo = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, OSLO_TZ) : null;
+    // Determine effectiveNow:
+    // - weekend => fridayLockMs if found, else last candle
+    // - stale => last candle
+    // - else => server time
+    let effectiveNowMs = serverNowMs;
+    let marketClosed = false;
+
+    if (weekendByServer || weekendByLastCandle) {
+      marketClosed = true;
+      if (fridayLockMs != null) effectiveNowMs = fridayLockMs;
+      else if (last5mMs != null) effectiveNowMs = last5mMs;
+    } else if (stale) {
+      marketClosed = true;
+      if (last5mMs != null) effectiveNowMs = last5mMs;
+    }
+
+    const effectiveNowOslo = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, OSLO_TZ) : null;
     const effectiveNowUtc = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, "UTC") : null;
 
-    // Daily D-1/D-2 anchored to effective date (prevents weekend issues)
     const { d1, d2, mode } = pickD1D2(daily, asof, effectiveNowMs);
     const base = computeBaseDailyBiasFromD1(d1);
     const bias = base.bias;
 
     const { pdh, pdl } = getPDH_PDL_fromD1(d1);
 
-    // Sessions based on effective Oslo date (and candles up to effectiveNow)
     const m5Rows = normalizeM5(m5, effectiveNowMs);
     const targetOsloDate = effectiveNowMs != null ? getOsloParts(effectiveNowMs).date : null;
     const sameDay = targetOsloDate ? sliceByOsloDate(m5Rows, targetOsloDate) : [];
@@ -767,21 +766,20 @@ module.exports = async function handler(req, res) {
       symbol: "EURUSD",
       timezoneRequestedFromTwelveData: TZ_REQUEST,
 
-      // Keep last candle time visible + effective time used for sessions
       last5mUtc: last5mUtcStr || null,
       effectiveNowUtc,
-      effectiveNowOslo: nowOslo,
+      effectiveNowOslo,
 
-      // v1.2 output
       ...out,
 
-      // debug
       debug: {
         asofUsed: asof || null,
         staleGapMinutes: gapMinutes,
         staleThresholdMinutes: STALE_GAP_MINUTES,
         weekendByServer,
-        weekendByLastCandle: weekendByLast,
+        weekendByLastCandle,
+        fridayLockUtc: fridayLockMs != null ? formatMsInTz(fridayLockMs, "UTC") : null,
+        fridayLockOslo: fridayLockMs != null ? formatMsInTz(fridayLockMs, OSLO_TZ) : null,
         marketClosed,
         dailyPickMode: mode,
         D_1: d1?.datetime || null,
@@ -800,14 +798,10 @@ module.exports = async function handler(req, res) {
           londonSetup: sessions.londonSetup.stats,
           payoff: sessions.payoff.stats,
         },
-        filters: cls.tags || null,
         counts: { d1: daily.length, h1: h1.length, m5: m5.length, m5SameDay: sameDay.length },
       },
     });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: String(e?.message || e),
-    });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 };
