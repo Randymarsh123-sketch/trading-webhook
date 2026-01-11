@@ -1,9 +1,10 @@
 // 10_14_setups.js
-// v1.2.1 (London 10–14) — Non-bias setups + overlays
+// v1.3.0 (London 10–14) — Non-bias setups + overlays + LondonFirstSweep (Asia-qualified)
 //
 // Contains:
 // - FrankLondonMW (formerly Type C): double test → mean reversion (ONLY when Daily baseBias === "Ranging")
 // - ManipulationSweepReverseA / ManipulationSweepReverseB (overlays): Frankfurt manipulation → London sweep opposite → 10–14 move back in Frankfurt direction
+// - LondonFirstSweep (overlay / day-qualifier): Asia range built + Asia untouched 07–09 → FIRST London setup sweep (09–10) of key levels (0.5–8 pips) → qualify 10–14 reversal window
 //
 // This module does NOT fetch data. It only consumes:
 // - daily: output from daily_bias.js (computeDailyBias)
@@ -14,7 +15,7 @@
 // {
 //   ok: true,
 //   trade: "Yes"/"No",
-//   play: "FrankLondonMW" | "ManipulationSweepReverseA" | "ManipulationSweepReverseB" | null,
+//   play: "FrankLondonMW" | "ManipulationSweepReverseA" | "ManipulationSweepReverseB" | "LondonFirstSweep" | null,
 //   bias09: "Bullish"/"Bearish"/"Ranging",
 //   bias10: "Bullish"/"Bearish"/"Ranging",
 //   londonScenario: one of allowed,
@@ -24,11 +25,18 @@
 
 const PIP = 0.0001;
 
+// ---- LondonFirstSweep constants (locked) ----
+const LFS_MIN_SWEEP_PIPS = 0.5; // min wick beyond level
+const LFS_MAX_SWEEP_PIPS = 8;   // max wick beyond level
+const LFS_MIN_ASIA_RANGE_PIPS = 15; // Asia range must be >= 15 pips
+const LFS_PRE_LONDON_ASIA_SWEEP_MIN_PIPS = 0.5; // "no Asia sweep 07–09" threshold
+
 const ALLOWED_SCENARIOS = new Set([
   "slightly up first → then price down",
   "slightly down first → then price up",
   "range / back and forth",
   "double tap → mean reversion",
+  "london first sweep → reversal",
   "no trade (messy day)",
 ]);
 
@@ -37,9 +45,15 @@ function toNum(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-function pips(a, b) {
+function pipsAbs(a, b) {
   if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
   return Math.abs(a - b) / PIP;
+}
+
+function pipsSigned(a, b) {
+  // (b - a) in pips
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return (b - a) / PIP;
 }
 
 function getWindowStats(windowObj) {
@@ -217,10 +231,9 @@ function runFrankLondonMW(daily, sessions, ctx) {
     };
   }
 
-  // We look for "double tap" of either AsiaHigh or AsiaLow:
-  // - Frankfurt first test fails
-  // - London second test fails
-  //
+  // Double tap of either AsiaHigh or AsiaLow:
+  // - Frankfurt test fails
+  // - London test fails
   // Then trade is opposite direction (mean reversion / rotation).
   const ffHighTest = detectTestFail(ffRows, asiaHigh, "UP");
   const ldHighTest = detectTestFail(ldRows, asiaHigh, "UP");
@@ -231,7 +244,6 @@ function runFrankLondonMW(daily, sessions, ctx) {
   const highDoubleFail = ffHighTest.failed && ldHighTest.failed;
   const lowDoubleFail = ffLowTest.failed && ldLowTest.failed;
 
-  // If both sides double-fail (rare), day is messy (skip)
   if (highDoubleFail && lowDoubleFail) {
     return {
       ok: true,
@@ -246,7 +258,6 @@ function runFrankLondonMW(daily, sessions, ctx) {
   }
 
   if (highDoubleFail) {
-    // Second attempt at AsiaHigh failed -> take opposite (down)
     return {
       ok: true,
       trade: "Yes",
@@ -265,7 +276,6 @@ function runFrankLondonMW(daily, sessions, ctx) {
   }
 
   if (lowDoubleFail) {
-    // Second attempt at AsiaLow failed -> take opposite (up)
     return {
       ok: true,
       trade: "Yes",
@@ -296,19 +306,19 @@ function runFrankLondonMW(daily, sessions, ctx) {
 }
 
 // -------------------- ManipulationSweepReverse overlays --------------------
-function classifyFrankfurtManipulation(ffRows) {
-  // Conservative, objective heuristic:
-  // - Determine direction by where Frankfurt CLOSE sits inside Frankfurt range.
-  // - Needs minimum Frankfurt range (to avoid noise).
-  //
-  // Returns:
-  // { ok, dir: "UP"|"DOWN"|null, ffHigh, ffLow, ffOpen, ffClose, ffRangePips, closePosInRange }
-  if (!Array.isArray(ffRows) || ffRows.length < 3) {
+function classifyFrankfurtManipulationWick(ffRows) {
+  // Spec-accurate wick-dominance manipulation (measured from Frankfurt OPEN):
+  // - Frankfurt range >= 8 pips (high-low)
+  // - UP manip if:
+  //    upWickPips >= 4
+  //    AND upWickPips >= 1.7 * downWickPips
+  // - DOWN manip similarly
+  if (!Array.isArray(ffRows) || ffRows.length < 2) {
     return { ok: false, reason: "not_enough_frankfurt_rows" };
   }
 
-  const ffOpen = ffRows[0].open;
-  const ffClose = ffRows[ffRows.length - 1].close;
+  const ffOpen = toNum(ffRows[0]?.open);
+  if (!Number.isFinite(ffOpen)) return { ok: false, reason: "missing_frankfurt_open" };
 
   let ffHigh = -Infinity;
   let ffLow = Infinity;
@@ -318,49 +328,53 @@ function classifyFrankfurtManipulation(ffRows) {
     if (Number.isFinite(r.low) && r.low < ffLow) ffLow = r.low;
   }
 
-  const range = ffHigh - ffLow;
-  const ffRangePips = Number.isFinite(range) && range > 0 ? range / PIP : null;
-
-  if (!(Number.isFinite(ffRangePips) && ffRangePips >= 8)) {
-    return { ok: false, reason: "frankfurt_range_too_small", ffRangePips };
+  const rangePips = Number.isFinite(ffHigh) && Number.isFinite(ffLow) ? (ffHigh - ffLow) / PIP : null;
+  if (!(Number.isFinite(rangePips) && rangePips >= 8)) {
+    return { ok: false, reason: "frankfurt_range_too_small", ffHigh, ffLow, rangePips };
   }
 
-  const closePosInRange =
-    Number.isFinite(ffClose) && Number.isFinite(ffLow) && Number.isFinite(range) && range > 0
-      ? (ffClose - ffLow) / range
-      : null;
+  const upWickPips = Number.isFinite(ffHigh) ? (ffHigh - ffOpen) / PIP : null;
+  const downWickPips = Number.isFinite(ffLow) ? (ffOpen - ffLow) / PIP : null;
 
-  // Dir thresholds (conservative):
-  // - UP manipulation if closes in top 30% of its range
-  // - DOWN manipulation if closes in bottom 30%
+  const upOk =
+    Number.isFinite(upWickPips) &&
+    upWickPips >= 4 &&
+    Number.isFinite(downWickPips) &&
+    upWickPips >= 1.7 * downWickPips;
+
+  const downOk =
+    Number.isFinite(downWickPips) &&
+    downWickPips >= 4 &&
+    Number.isFinite(upWickPips) &&
+    downWickPips >= 1.7 * upWickPips;
+
   let dir = null;
-  if (typeof closePosInRange === "number" && Number.isFinite(closePosInRange)) {
-    if (closePosInRange >= 0.70) dir = "UP";
-    else if (closePosInRange <= 0.30) dir = "DOWN";
-  }
+  if (upOk && !downOk) dir = "UP";
+  else if (downOk && !upOk) dir = "DOWN";
+  else dir = null;
 
   if (!dir) {
     return {
       ok: false,
-      reason: "frankfurt_not_directional_enough",
+      reason: "no_clear_wick_manipulation",
+      ffOpen,
       ffHigh,
       ffLow,
-      ffOpen,
-      ffClose,
-      ffRangePips,
-      closePosInRange,
+      rangePips,
+      upWickPips,
+      downWickPips,
     };
   }
 
   return {
     ok: true,
     dir,
+    ffOpen,
     ffHigh,
     ffLow,
-    ffOpen,
-    ffClose,
-    ffRangePips,
-    closePosInRange,
+    rangePips,
+    upWickPips,
+    downWickPips,
   };
 }
 
@@ -375,7 +389,6 @@ function detectLondonSweepOpposite(ldRows, manipulation) {
     const level = manipulation.ffLow;
     const sweep = findFirstBreak(ldRows, level, "DOWN");
     if (!sweep) return { ok: false, reason: "no_sweep_of_frankfurt_low" };
-    // confirm it returns back above the level within London setup (close > level)
     const returned = ldRows.some((r) => Number.isFinite(r.close) && r.close > level);
     if (!returned) return { ok: false, reason: "sweep_no_return_above_level" };
     return { ok: true, sweepSide: "LOW", level, sweepRow: sweep };
@@ -385,7 +398,6 @@ function detectLondonSweepOpposite(ldRows, manipulation) {
     const level = manipulation.ffHigh;
     const sweep = findFirstBreak(ldRows, level, "UP");
     if (!sweep) return { ok: false, reason: "no_sweep_of_frankfurt_high" };
-    // confirm it returns back below the level within London setup (close < level)
     const returned = ldRows.some((r) => Number.isFinite(r.close) && r.close < level);
     if (!returned) return { ok: false, reason: "sweep_no_return_below_level" };
     return { ok: true, sweepSide: "HIGH", level, sweepRow: sweep };
@@ -395,7 +407,7 @@ function detectLondonSweepOpposite(ldRows, manipulation) {
 }
 
 function reachesTargetWithoutBreakingSweep(payoffRows, sweepRow, dir /* "UP"|"DOWN" */, targetPips) {
-  // We measure from the sweep extreme (the wick point) to payoff excursion.
+  // Measure from sweep extreme to payoff excursion.
   // Constraint: sweep extreme must not be broken again BEFORE target is reached.
   if (!Array.isArray(payoffRows) || payoffRows.length === 0) return { ok: false, reason: "missing_payoff_rows" };
   if (!sweepRow) return { ok: false, reason: "missing_sweep_row" };
@@ -407,15 +419,13 @@ function reachesTargetWithoutBreakingSweep(payoffRows, sweepRow, dir /* "UP"|"DO
   if (dir === "UP") {
     if (!Number.isFinite(sweepLow)) return { ok: false, reason: "missing_sweep_low" };
 
-    // Find earliest time we reach target: (payoffHigh - sweepLow) >= target
     let bestHigh = -Infinity;
     for (let i = 0; i < payoffRows.length; i++) {
       const r = payoffRows[i];
       if (Number.isFinite(r.high) && r.high > bestHigh) bestHigh = r.high;
 
-      const movePips = pips(sweepLow, bestHigh);
+      const movePips = pipsAbs(sweepLow, bestHigh);
       if (Number.isFinite(movePips) && movePips >= targetPips) {
-        // ensure sweep low not broken before reaching target
         for (let j = 0; j <= i; j++) {
           const rr = payoffRows[j];
           if (Number.isFinite(rr.low) && rr.low < sweepLow) {
@@ -431,15 +441,13 @@ function reachesTargetWithoutBreakingSweep(payoffRows, sweepRow, dir /* "UP"|"DO
   if (dir === "DOWN") {
     if (!Number.isFinite(sweepHigh)) return { ok: false, reason: "missing_sweep_high" };
 
-    // earliest time we reach target: (sweepHigh - payoffLow) >= target
     let bestLow = Infinity;
     for (let i = 0; i < payoffRows.length; i++) {
       const r = payoffRows[i];
       if (Number.isFinite(r.low) && r.low < bestLow) bestLow = r.low;
 
-      const movePips = pips(sweepHigh, bestLow);
+      const movePips = pipsAbs(sweepHigh, bestLow);
       if (Number.isFinite(movePips) && movePips >= targetPips) {
-        // ensure sweep high not broken before reaching target
         for (let j = 0; j <= i; j++) {
           const rr = payoffRows[j];
           if (Number.isFinite(rr.high) && rr.high > sweepHigh) {
@@ -491,7 +499,7 @@ function runManipulationSweepReverse(daily, sessions, ctx) {
     };
   }
 
-  const manipulation = classifyFrankfurtManipulation(ffRows);
+  const manipulation = classifyFrankfurtManipulationWick(ffRows);
   if (!manipulation.ok) {
     return {
       ok: true,
@@ -564,6 +572,290 @@ function runManipulationSweepReverse(daily, sessions, ctx) {
   };
 }
 
+// -------------------- LondonFirstSweep (Asia-qualified) --------------------
+function computeHiLoFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return { ok: false, reason: "no_rows" };
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (const r of rows) {
+    if (Number.isFinite(r?.high) && r.high > hi) hi = r.high;
+    if (Number.isFinite(r?.low) && r.low < lo) lo = r.low;
+  }
+  if (!Number.isFinite(hi) || !Number.isFinite(lo) || !(hi > lo)) return { ok: false, reason: "invalid_hilo", hi, lo };
+  return { ok: true, high: hi, low: lo };
+}
+
+function findFirstSweepOfLevelInWindow(rows, level, side /* "UP"|"DOWN" */, minPips, maxPips) {
+  // Returns { ok:true, row, sweepPips, extreme } where:
+  // - For UP sweep: extreme = row.high, sweepPips = (row.high - level)/PIP
+  // - For DOWN sweep: extreme = row.low, sweepPips = (level - row.low)/PIP
+  if (!Array.isArray(rows) || rows.length === 0) return { ok: false, reason: "no_rows" };
+  if (!Number.isFinite(level)) return { ok: false, reason: "invalid_level" };
+  if (!Number.isFinite(minPips) || !Number.isFinite(maxPips) || minPips < 0 || maxPips <= 0 || maxPips < minPips) {
+    return { ok: false, reason: "invalid_pip_bounds" };
+  }
+
+  for (const r of rows) {
+    if (!r) continue;
+
+    if (side === "UP") {
+      if (!Number.isFinite(r.high)) continue;
+      if (r.high <= level) continue;
+      const sp = (r.high - level) / PIP;
+      if (sp >= minPips && sp <= maxPips) {
+        return { ok: true, row: r, sweepPips: sp, extreme: r.high };
+      }
+    } else {
+      if (!Number.isFinite(r.low)) continue;
+      if (r.low >= level) continue;
+      const sp = (level - r.low) / PIP;
+      if (sp >= minPips && sp <= maxPips) {
+        return { ok: true, row: r, sweepPips: sp, extreme: r.low };
+      }
+    }
+  }
+
+  return { ok: false, reason: "no_sweep_in_bounds" };
+}
+
+function hasAsiaSweepBetween0709(ffRows, asiaHigh, asiaLow, minPips) {
+  // "No sweep of Asia between 07:00–08:59" (Frankfurt session)
+  // We interpret "sweep" as wick beyond AsiaHigh/Low by >= minPips.
+  if (!Array.isArray(ffRows) || ffRows.length === 0) return false;
+  if (!Number.isFinite(asiaHigh) || !Number.isFinite(asiaLow) || !Number.isFinite(minPips)) return false;
+
+  const minMove = minPips * PIP;
+  for (const r of ffRows) {
+    if (!r) continue;
+    if (Number.isFinite(r.high) && r.high >= asiaHigh + minMove) return true;
+    if (Number.isFinite(r.low) && r.low <= asiaLow - minMove) return true;
+  }
+  return false;
+}
+
+function buildCandidateLevels(sessions, ctx) {
+  // We include the "key places" set used in testing:
+  // - Asia H/L, Asia mid
+  // - PDH/PDL
+  // - Frankfurt H/L
+  // - Prior session H/L (Asia+Frankfurt combined)
+  // - London open (09:00 candle open)
+  const { st: asiaSt, rows: asiaRows } = getWindowStats(sessions?.asia);
+  const { st: ffSt, rows: ffRows } = getWindowStats(sessions?.frankfurt);
+  const { rows: ldRows } = getWindowStats(sessions?.londonSetup);
+
+  const levels = [];
+
+  const asiaHigh = toNum(asiaSt?.high);
+  const asiaLow = toNum(asiaSt?.low);
+  if (Number.isFinite(asiaHigh) && Number.isFinite(asiaLow)) {
+    levels.push({ name: "ASIA_HIGH", level: asiaHigh, side: "UP" });
+    levels.push({ name: "ASIA_LOW", level: asiaLow, side: "DOWN" });
+    levels.push({ name: "ASIA_MID", level: (asiaHigh + asiaLow) / 2, side: "BOTH" });
+  }
+
+  const PDH = toNum(ctx?.pdh);
+  const PDL = toNum(ctx?.pdl);
+  if (Number.isFinite(PDH)) levels.push({ name: "PDH", level: PDH, side: "UP" });
+  if (Number.isFinite(PDL)) levels.push({ name: "PDL", level: PDL, side: "DOWN" });
+
+  const ffHigh = toNum(ffSt?.high);
+  const ffLow = toNum(ffSt?.low);
+  if (Number.isFinite(ffHigh)) levels.push({ name: "FRANKFURT_HIGH", level: ffHigh, side: "UP" });
+  if (Number.isFinite(ffLow)) levels.push({ name: "FRANKFURT_LOW", level: ffLow, side: "DOWN" });
+
+  // Prior session (Asia+Frankfurt) high/low from rows
+  const priorRows = []
+    .concat(Array.isArray(asiaRows) ? asiaRows : [])
+    .concat(Array.isArray(ffRows) ? ffRows : []);
+  const prior = computeHiLoFromRows(priorRows);
+  if (prior.ok) {
+    levels.push({ name: "PRIOR_SESSION_HIGH", level: prior.high, side: "UP" });
+    levels.push({ name: "PRIOR_SESSION_LOW", level: prior.low, side: "DOWN" });
+  }
+
+  // London open = first candle open in londonSetup
+  const londonOpen = toNum(ldRows?.[0]?.open);
+  if (Number.isFinite(londonOpen)) levels.push({ name: "LONDON_OPEN", level: londonOpen, side: "BOTH" });
+
+  return {
+    ok: true,
+    levels,
+    asiaHigh,
+    asiaLow,
+  };
+}
+
+function pickFirstLondonSweep(ldRows, candidates, minPips, maxPips) {
+  // Deterministically pick the earliest sweep across all candidate levels.
+  // If multiple sweeps occur on same candle, choose by candidate order.
+  if (!Array.isArray(ldRows) || ldRows.length === 0) return { ok: false, reason: "missing_london_setup_rows" };
+  if (!Array.isArray(candidates) || candidates.length === 0) return { ok: false, reason: "no_candidate_levels" };
+
+  let best = null;
+
+  // We scan candles in chronological order, and for each candle scan candidates in fixed order.
+  for (const r of ldRows) {
+    if (!r) continue;
+
+    for (const c of candidates) {
+      if (!c || !Number.isFinite(c.level)) continue;
+
+      // BOTH means we accept either UP or DOWN sweep around same level
+      const sideList = c.side === "BOTH" ? ["UP", "DOWN"] : [c.side];
+
+      for (const side of sideList) {
+        if (side === "UP") {
+          if (!Number.isFinite(r.high)) continue;
+          if (r.high <= c.level) continue;
+          const sp = (r.high - c.level) / PIP;
+          if (sp >= minPips && sp <= maxPips) {
+            best = { levelName: c.name, level: c.level, sweepSide: "UP", row: r, sweepPips: sp, extreme: r.high };
+            return { ok: true, ...best };
+          }
+        } else {
+          if (!Number.isFinite(r.low)) continue;
+          if (r.low >= c.level) continue;
+          const sp = (c.level - r.low) / PIP;
+          if (sp >= minPips && sp <= maxPips) {
+            best = { levelName: c.name, level: c.level, sweepSide: "DOWN", row: r, sweepPips: sp, extreme: r.low };
+            return { ok: true, ...best };
+          }
+        }
+      }
+    }
+  }
+
+  return { ok: false, reason: "no_london_first_sweep_found" };
+}
+
+function runLondonFirstSweep(daily, sessions, ctx) {
+  const baseBias = String(daily?.baseBias || "").trim();
+  const bias09 = daily?.bias09 || baseBias || "Ranging";
+  const bias10 = daily?.bias10 || baseBias || "Ranging";
+
+  const marketClosed = !!ctx?.marketClosed;
+  if (marketClosed) {
+    return {
+      ok: true,
+      trade: "No",
+      play: null,
+      bias09,
+      bias10,
+      londonScenario: "no trade (messy day)",
+      reason: "market_closed",
+      debug: { marketClosed: true },
+    };
+  }
+
+  const { st: asiaSt, rows: asiaRows } = getWindowStats(sessions?.asia);
+  const { rows: ffRows } = getWindowStats(sessions?.frankfurt);
+  const { rows: ldRows } = getWindowStats(sessions?.londonSetup);
+
+  if (!asiaSt || !asiaRows.length || !ffRows.length || !ldRows.length) {
+    return {
+      ok: true,
+      trade: "No",
+      play: null,
+      bias09,
+      bias10,
+      londonScenario: "no trade (messy day)",
+      reason: "missing_sessions",
+      debug: { haveAsia: !!asiaSt, asiaCount: asiaRows.length, ffCount: ffRows.length, ldCount: ldRows.length },
+    };
+  }
+
+  const asiaHigh = toNum(asiaSt.high);
+  const asiaLow = toNum(asiaSt.low);
+  if (!Number.isFinite(asiaHigh) || !Number.isFinite(asiaLow) || !(asiaHigh > asiaLow)) {
+    return {
+      ok: true,
+      trade: "No",
+      play: null,
+      bias09,
+      bias10,
+      londonScenario: "no trade (messy day)",
+      reason: "invalid_asia_levels",
+      debug: { asiaHigh, asiaLow },
+    };
+  }
+
+  const asiaRangePips = (asiaHigh - asiaLow) / PIP;
+  if (!(Number.isFinite(asiaRangePips) && asiaRangePips >= LFS_MIN_ASIA_RANGE_PIPS)) {
+    return {
+      ok: true,
+      trade: "No",
+      play: null,
+      bias09,
+      bias10,
+      londonScenario: "no trade (messy day)",
+      reason: "asia_range_too_small",
+      debug: { asiaRangePips, minRequired: LFS_MIN_ASIA_RANGE_PIPS },
+    };
+  }
+
+  // Filter: NO Asia H/L sweep during 07:00–08:59
+  const preTouched = hasAsiaSweepBetween0709(ffRows, asiaHigh, asiaLow, LFS_PRE_LONDON_ASIA_SWEEP_MIN_PIPS);
+  if (preTouched) {
+    return {
+      ok: true,
+      trade: "No",
+      play: null,
+      bias09,
+      bias10,
+      londonScenario: "no trade (messy day)",
+      reason: "asia_touched_before_london",
+      debug: { asiaHigh, asiaLow, minPips: LFS_PRE_LONDON_ASIA_SWEEP_MIN_PIPS },
+    };
+  }
+
+  // Build key levels & find FIRST London sweep (09–10) within bounds 0.5–8 pips.
+  const lvl = buildCandidateLevels(sessions, ctx);
+  const candidates = Array.isArray(lvl.levels) ? lvl.levels : [];
+  const first = pickFirstLondonSweep(ldRows, candidates, LFS_MIN_SWEEP_PIPS, LFS_MAX_SWEEP_PIPS);
+
+  if (!first.ok) {
+    return {
+      ok: true,
+      trade: "No",
+      play: null,
+      bias09,
+      bias10,
+      londonScenario: "no trade (messy day)",
+      reason: "no_london_first_sweep_in_bounds",
+      debug: { first, asiaRangePips },
+    };
+  }
+
+  // This overlay is a DAY-QUALIFIER.
+  // It does not define entry; it marks the day as eligible for 10–14 reversal logic.
+  return {
+    ok: true,
+    trade: "Yes",
+    play: "LondonFirstSweep",
+    bias09,
+    bias10,
+    londonScenario: "london first sweep → reversal",
+    reason: "london_first_sweep_asia_qualified",
+    debug: {
+      asiaRangePips,
+      asiaHigh,
+      asiaLow,
+      preTouchedAsia0709: preTouched,
+      sweep: {
+        levelName: first.levelName,
+        level: first.level,
+        sweepSide: first.sweepSide, // UP => expect down, DOWN => expect up (execution handled elsewhere)
+        sweepPips: first.sweepPips,
+        extreme: first.extreme,
+        ms: first.row?.ms,
+        osloHHMM: first.row?.osloHHMM,
+      },
+      bounds: { minPips: LFS_MIN_SWEEP_PIPS, maxPips: LFS_MAX_SWEEP_PIPS },
+    },
+  };
+}
+
 // -------------------- Public entry: runSetups --------------------
 function runSetups(daily, sessions, ctx) {
   const baseBias = String(daily?.baseBias || "").trim();
@@ -588,11 +880,15 @@ function runSetups(daily, sessions, ctx) {
   const mw = runFrankLondonMW(daily, sessions, ctx);
   if (mw.trade === "Yes") return mw;
 
-  // 2) Try overlays (can occur on any day that wasn't already a bias-play)
+  // 2) Try ManipulationSweepReverse overlays
   const overlay = runManipulationSweepReverse(daily, sessions, ctx);
   if (overlay.trade === "Yes") return overlay;
 
-  // 3) Nothing
+  // 3) Try LondonFirstSweep (Asia-qualified) as day-qualifier overlay
+  const lfs = runLondonFirstSweep(daily, sessions, ctx);
+  if (lfs.trade === "Yes") return lfs;
+
+  // 4) Nothing
   return {
     ok: true,
     trade: "No",
@@ -601,7 +897,7 @@ function runSetups(daily, sessions, ctx) {
     bias10,
     londonScenario: "no trade (messy day)",
     reason: "no_setups_found",
-    debug: { baseBias, mwReason: mw.reason, overlayReason: overlay.reason },
+    debug: { baseBias, mwReason: mw.reason, overlayReason: overlay.reason, lfsReason: lfs.reason },
   };
 }
 
