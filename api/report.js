@@ -1,15 +1,14 @@
-// /api/report.js — LOCKED v1.2 (single-file “heavy” version, WEEKEND HARD-LOCK TO FRIDAY)
-// Implements:
-// - Data refresh: TwelveData 1D/1H/5M (timezone=UTC) + overwrite Redis keys
-// - Daily bias (ONLY from D-1 and D-2 daily candles; bias never changes intraday)
-// - Session model (Oslo): Asia 02–06, Frankfurt 07–08, London setup 09–10, Payoff 10–14
-// - Type A / B / C logic (mechanical, deterministic)
-// - Hard filters (wrong-side first, overlap/rot proxy, no structure before 10, Wed+wrong-side)
-// - Overlay on non-bias/no-trade: Frankfurt-manip + London-sweep + reversal (A/B quality only)
-// - IMPORTANT FIXES:
-//   (1) Weekend hard-lock: If Oslo day is Sat/Sun, we pin effectiveNow to the LAST FRIDAY candle in the 5M feed,
-//       so the system never builds Sunday sessions even if the feed provides Sunday timestamps.
-//   (2) Stale guard: If gap between server time and last candle is big, we pin to last candle.
+// /api/report.js — LOCKED v1.2 (single-file “heavy” version)
+// Live mode:
+// - Weekend hard-lock: if Oslo day is Sat/Sun -> pin effectiveNow to LAST FRIDAY candle in 5M feed
+// - marketClosed=true on weekend/stale -> Trade always No
+//
+// Backtest mode:
+// - Use: ?mode=backtest&asof=YYYY-MM-DD
+// - effectiveNow is set to asof date at 13:55 Oslo (end of payoff window)
+// - Sessions (Asia/FF/London/Payoff) are built from the ASOF day (not Friday-lock)
+// - marketClosed=false in backtest (so Type A/B/C/Overlay can trigger)
+//
 // Output contract (top-level):
 // - trade: "Yes"/"No"
 // - bias09: "Bullish"/"Bearish"/"Ranging"
@@ -23,8 +22,6 @@ const TZ_REQUEST = "UTC";
 const OSLO_TZ = "Europe/Oslo";
 const PIP = 0.0001;
 
-// If the gap between server time and last 5m candle is bigger than this,
-// we treat the feed as stale and pin effectiveNow to last candle.
 const STALE_GAP_MINUTES = 60;
 
 const redis = new Redis({
@@ -99,7 +96,7 @@ function pips(a, b) {
 
 function getOsloWeekdayShort(ms) {
   const parts = new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "short" }).formatToParts(new Date(ms));
-  return (parts.find((p) => p.type === "weekday")?.value || "").toLowerCase(); // "mon"..."sun"
+  return (parts.find((p) => p.type === "weekday")?.value || "").toLowerCase();
 }
 
 function isWeekendOslo(ms) {
@@ -116,11 +113,8 @@ function weekdayNameOslo(ms) {
   return new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "long" }).format(new Date(ms));
 }
 
-// Find the most recent Friday candle timestamp in the 5M feed (Oslo weekday).
-// m5Values is expected latest-first from TwelveData (but we don't rely on sort).
 function findLastFridayCandleMs(m5Values) {
   if (!Array.isArray(m5Values) || m5Values.length === 0) return null;
-
   let best = null;
   for (const c of m5Values) {
     const ms = parseUtcDatetimeToMs(c?.datetime);
@@ -129,6 +123,28 @@ function findLastFridayCandleMs(m5Values) {
     if (wk === "fri") {
       if (best == null || ms > best) best = ms;
     }
+  }
+  return best;
+}
+
+// Convert "YYYY-MM-DD" to a UTC ms that corresponds to 13:55 Oslo on that date.
+// We do this deterministically by scanning the 5M candles and picking the last candle
+// that is (a) on that Oslo date and (b) at or before 13:55 Oslo.
+// This avoids DST pitfalls without needing a timezone parser.
+function findBacktestEffectiveMsFromM5(m5Values, asofOsloDate) {
+  if (!Array.isArray(m5Values) || !asofOsloDate) return null;
+
+  let best = null;
+  for (const c of m5Values) {
+    const ms = parseUtcDatetimeToMs(c?.datetime);
+    if (ms == null) continue;
+    const { date, hh, mm } = getOsloParts(ms);
+    if (date !== asofOsloDate) continue;
+
+    const beforeOrAt1355 = hh < 13 || (hh === 13 && mm <= 55);
+    if (!beforeOrAt1355) continue;
+
+    if (best == null || ms > best) best = ms;
   }
   return best;
 }
@@ -176,9 +192,6 @@ function getPDH_PDL_fromD1(d1) {
   return { pdh: Number.isFinite(pdh) ? pdh : null, pdl: Number.isFinite(pdl) ? pdl : null };
 }
 
-// Pick D-1/D-2 deterministically.
-// - If asof=YYYY-MM-DD: D-1 = that date, D-2 = next element
-// - Else: pick latest daily candle whose date (YYYY-MM-DD) <= effective Oslo date (string compare)
 function pickD1D2(dailyValues, asof, effectiveNowMs) {
   if (!Array.isArray(dailyValues) || dailyValues.length < 2) return { d1: null, d2: null, mode: "none" };
 
@@ -202,7 +215,7 @@ function pickD1D2(dailyValues, asof, effectiveNowMs) {
 }
 
 // -------------------------
-// Intraday normalization + sessions (M5, Oslo date of effectiveNow)
+// Intraday normalization + sessions
 // -------------------------
 function normalizeM5(latest5M, effectiveNowMs) {
   const rows = [];
@@ -273,7 +286,7 @@ function computeSessions(rowsSameDay) {
 }
 
 // -------------------------
-// Hard filters (mechanical proxies)
+// Hard filters
 // -------------------------
 function detectWrongSideBreakFirst(rowsSameDay, bias, pdh, pdl) {
   if (!rowsSameDay.length) return { ok: false, wrongSide: false, reason: "no_rows" };
@@ -579,7 +592,7 @@ function overlayQuality(ffManip, ldSweep) {
 }
 
 // -------------------------
-// Scenario mapping (allowed values only)
+// Scenario mapping
 // -------------------------
 const ALLOWED_SCENARIOS = new Set([
   "slightly up first → then price down",
@@ -682,6 +695,12 @@ function makeOutput({ trade, bias, scenario }) {
 module.exports = async function handler(req, res) {
   try {
     const asof = typeof req.query.asof === "string" ? req.query.asof.trim() : null;
+    const mode = typeof req.query.mode === "string" ? req.query.mode.trim().toLowerCase() : "live";
+    const isBacktest = mode === "backtest";
+
+    if (isBacktest && !asof) {
+      return res.status(400).json({ ok: false, error: "Backtest mode requires ?asof=YYYY-MM-DD" });
+    }
 
     const [d1Resp, h1Resp, m5Resp] = await Promise.all([
       tdFetchCandles("1day", 400),
@@ -708,39 +727,47 @@ module.exports = async function handler(req, res) {
 
     const weekendByServer = isWeekendOslo(serverNowMs);
     const weekendByLastCandle = last5mMs != null ? isWeekendOslo(last5mMs) : false;
-
     const stale = gapMinutes != null ? gapMinutes > STALE_GAP_MINUTES : true;
 
-    // WEEKEND HARD-LOCK:
-    // If it's weekend (server or last candle), pin effectiveNow to LAST FRIDAY candle in the feed.
     let fridayLockMs = null;
     if (weekendByServer || weekendByLastCandle) {
       fridayLockMs = findLastFridayCandleMs(m5);
     }
 
-    // Determine effectiveNow:
-    // - weekend => fridayLockMs if found, else last candle
-    // - stale => last candle
-    // - else => server time
+    // Determine effectiveNow & marketClosed depending on mode
     let effectiveNowMs = serverNowMs;
     let marketClosed = false;
 
-    if (weekendByServer || weekendByLastCandle) {
-      marketClosed = true;
-      if (fridayLockMs != null) effectiveNowMs = fridayLockMs;
-      else if (last5mMs != null) effectiveNowMs = last5mMs;
-    } else if (stale) {
-      marketClosed = true;
-      if (last5mMs != null) effectiveNowMs = last5mMs;
+    if (isBacktest) {
+      // Backtest overrides weekend lock and marketClosed.
+      // effectiveNow = last 5M candle on ASOF date at or before 13:55 Oslo
+      const btMs = findBacktestEffectiveMsFromM5(m5, asof);
+      if (btMs == null) {
+        return res.status(400).json({
+          ok: false,
+          error: `Backtest: could not find 5M candles for Oslo date ${asof} (need candles up to 13:55 Oslo).`,
+        });
+      }
+      effectiveNowMs = btMs;
+      marketClosed = false;
+    } else {
+      // Live mode (weekend hard-lock)
+      if (weekendByServer || weekendByLastCandle) {
+        marketClosed = true;
+        if (fridayLockMs != null) effectiveNowMs = fridayLockMs;
+        else if (last5mMs != null) effectiveNowMs = last5mMs;
+      } else if (stale) {
+        marketClosed = true;
+        if (last5mMs != null) effectiveNowMs = last5mMs;
+      }
     }
 
     const effectiveNowOslo = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, OSLO_TZ) : null;
     const effectiveNowUtc = effectiveNowMs != null ? formatMsInTz(effectiveNowMs, "UTC") : null;
 
-    const { d1, d2, mode } = pickD1D2(daily, asof, effectiveNowMs);
+    const { d1, d2, mode: dailyPickMode } = pickD1D2(daily, asof, effectiveNowMs);
     const base = computeBaseDailyBiasFromD1(d1);
     const bias = base.bias;
-
     const { pdh, pdl } = getPDH_PDL_fromD1(d1);
 
     const m5Rows = normalizeM5(m5, effectiveNowMs);
@@ -766,6 +793,7 @@ module.exports = async function handler(req, res) {
       symbol: "EURUSD",
       timezoneRequestedFromTwelveData: TZ_REQUEST,
 
+      mode: isBacktest ? "backtest" : "live",
       last5mUtc: last5mUtcStr || null,
       effectiveNowUtc,
       effectiveNowOslo,
@@ -781,7 +809,7 @@ module.exports = async function handler(req, res) {
         fridayLockUtc: fridayLockMs != null ? formatMsInTz(fridayLockMs, "UTC") : null,
         fridayLockOslo: fridayLockMs != null ? formatMsInTz(fridayLockMs, OSLO_TZ) : null,
         marketClosed,
-        dailyPickMode: mode,
+        dailyPickMode,
         D_1: d1?.datetime || null,
         D_2: d2?.datetime || null,
         baseBias: bias,
