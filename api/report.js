@@ -1,5 +1,9 @@
 // report.js
-// v1.2.1 — REN MOTOR (orkestrator) for London 10–14
+// v1.2.2 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE
+//
+// NEW:
+// - ?mode=status  -> returns a SHORT, paste-friendly JSON ("status packet")
+// - ?mode=backtest&asof=YYYY-MM-DD  -> unchanged backtest mode
 //
 // Files expected in SAME /api folder:
 // - ./daily_bias.js            (computeDailyBias)
@@ -23,7 +27,7 @@
 const OSLO_TZ = "Europe/Oslo";
 const SYMBOL_TD = "EUR/USD";
 const SYMBOL_OUT = "EURUSD";
-const VERSION = "v1.2.1";
+const VERSION = "v1.2.2";
 
 const { computeDailyBias } = require("./daily_bias");
 const { runBiasPlays } = require("./10_14_biasplays");
@@ -305,8 +309,7 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
     const asofStr = String(asof || "").trim();
     const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
 
-    // Create a "YYYY-MM-DD 13:55:00" in Oslo, then convert to UTC ms by iterating candles:
-    // simplest and deterministic: pick the last candle whose OsloDate == targetDate and osloHHMM <= 13:55
+    // Pick last candle whose OsloDate == targetDate and osloHHMM <= 13:55
     let best = null;
     for (const c of candles5mAsc) {
       const ms = parseUtcDatetimeToMs(c.datetime);
@@ -361,7 +364,7 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
     marketClosed = true;
   }
 
-  // If stale beyond threshold, treat as closed (or at least do not trade)
+  // If stale beyond threshold, treat as closed
   if (staleGapMinutes != null && staleGapMinutes > staleThreshold) {
     marketClosed = true;
   }
@@ -406,12 +409,93 @@ function buildRowsSameDayAsOf(candles5mAsc, effectiveNowMs, osloDateUsed) {
   return out;
 }
 
+// -------------------- Status builder --------------------
+function buildStatusPacket({
+  ok,
+  version,
+  symbol,
+  mode,
+  last5mUtc,
+  effectiveNowUtc,
+  effectiveNowOslo,
+  trade,
+  bias09,
+  bias10,
+  londonScenario,
+  ctx,
+  sessions,
+  final,
+  classification,
+}) {
+  const asia = sessions?.asia?.stats || null;
+  const ff = sessions?.frankfurt?.stats || null;
+  const ld = sessions?.londonSetup?.stats || null;
+  const po = sessions?.payoff?.stats || null;
+
+  // Pull out LondonFirstSweep details if present
+  const lfs = final?.play === "LondonFirstSweep" ? final?.debug?.sweep || null : null;
+
+  return {
+    ok: !!ok,
+    mode: "status",
+    version,
+    symbol,
+    engineMode: mode, // live/backtest
+    last5mUtc,
+    effectiveNowUtc,
+    effectiveNowOslo,
+
+    trade,
+    play: final?.play || null,
+    reason: final?.reason || null,
+    bias09,
+    bias10,
+    londonScenario,
+
+    marketClosed: !!ctx?.marketClosed,
+    weekdayOslo: ctx?.weekdayOslo || null,
+    osloDateUsed: ctx?.osloDateUsed || null,
+
+    levels: {
+      pdh: ctx?.pdh ?? null,
+      pdl: ctx?.pdl ?? null,
+    },
+
+    sessions: {
+      asia,
+      frankfurt: ff,
+      londonSetup: ld,
+      payoff: po,
+    },
+
+    londonFirstSweep: lfs
+      ? {
+          levelName: lfs.levelName ?? null,
+          level: lfs.level ?? null,
+          sweepSide: lfs.sweepSide ?? null, // UP sweep => expect down; DOWN sweep => expect up
+          sweepPips: lfs.sweepPips ?? null,
+          extreme: lfs.extreme ?? null,
+          osloHHMM: lfs.osloHHMM ?? null,
+        }
+      : null,
+
+    classification,
+  };
+}
+
 // -------------------- Main handler --------------------
 module.exports = async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const asof = url.searchParams.get("asof"); // YYYY-MM-DD
-    const mode = url.searchParams.get("mode") === "backtest" ? "backtest" : "live";
+
+    // IMPORTANT:
+    // We reuse ?mode=status without breaking existing behavior:
+    // - engineMode: backtest/live
+    // - outputMode: status/full
+    const modeParam = url.searchParams.get("mode") || "";
+    const outputMode = modeParam === "status" ? "status" : "full";
+    const mode = modeParam === "backtest" ? "backtest" : "live";
 
     // Fetch candles (sizes chosen for safety)
     const [d1Resp, h1Resp, m5Resp] = await Promise.all([
@@ -449,6 +533,24 @@ module.exports = async function handler(req, res) {
     // Pick D-1/D-2
     const pick = pickD1D2(dailyCandles, mode === "backtest" ? asof : null, osloDateUsed);
     if (!pick.ok) {
+      // In status mode, still return a short packet
+      if (outputMode === "status") {
+        return res.status(200).json({
+          ok: false,
+          mode: "status",
+          version: VERSION,
+          symbol: SYMBOL_OUT,
+          engineMode: mode,
+          error: "daily_pick_failed",
+          debug: {
+            asofUsed: mode === "backtest" ? asof : null,
+            osloDateUsed,
+            weekdayOslo,
+            pick,
+          },
+        });
+      }
+
       return res.status(200).json({
         ok: false,
         version: VERSION,
@@ -472,6 +574,18 @@ module.exports = async function handler(req, res) {
     // Daily bias computation
     const daily = computeDailyBias(D_1, D_2);
     if (!daily.ok) {
+      if (outputMode === "status") {
+        return res.status(200).json({
+          ok: false,
+          mode: "status",
+          version: VERSION,
+          symbol: SYMBOL_OUT,
+          engineMode: mode,
+          error: "daily_bias_failed",
+          debug: { daily },
+        });
+      }
+
       return res.status(200).json({
         ok: false,
         version: VERSION,
@@ -492,6 +606,9 @@ module.exports = async function handler(req, res) {
       rowsSameDay,
       weekdayOslo,
       marketClosed: !!eff.marketClosed,
+
+      // extra (for status)
+      osloDateUsed,
     };
 
     // Run modules in locked order
@@ -500,9 +617,7 @@ module.exports = async function handler(req, res) {
 
     if (biasPlay.trade !== "Yes") {
       const setup = runSetups(daily, sessions, ctx);
-      final = setup.trade === "Yes" ? setup : setup; // keep setup response (gives reasons)
-      // If neither gives trade, final remains setup "No" with reasons; that's fine.
-      // But we want bias fields consistent; setup returns them.
+      final = setup; // keep setup response (gives reasons)
     }
 
     // Ensure outputs are clean
@@ -517,6 +632,35 @@ module.exports = async function handler(req, res) {
         ? { type: String(final.play || "SIGNAL"), reason: String(final.reason || "signal") }
         : { type: "NO_TRADE", reason: String(final.reason || "no_signal") };
 
+    // ✅ NEW: STATUS output (short)
+    if (outputMode === "status") {
+      return res.status(200).json(
+        buildStatusPacket({
+          ok: true,
+          version: VERSION,
+          symbol: SYMBOL_OUT,
+          mode,
+          last5mUtc: eff.last5mUtc,
+          effectiveNowUtc: eff.effectiveNowUtc,
+          effectiveNowOslo: eff.effectiveNowOslo,
+          trade,
+          bias09,
+          bias10,
+          londonScenario,
+          ctx: {
+            ...ctx,
+            marketClosed: !!eff.marketClosed,
+            weekdayOslo,
+            osloDateUsed,
+          },
+          sessions,
+          final,
+          classification,
+        })
+      );
+    }
+
+    // Default: full report (unchanged, just version bumped)
     return res.status(200).json({
       ok: true,
       version: VERSION,
@@ -586,5 +730,8 @@ module.exports = async function handler(req, res) {
       symbol: SYMBOL_OUT,
       error: String(err?.message || err),
     });
+  }
+};
+
   }
 };
