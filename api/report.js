@@ -2,6 +2,10 @@
 // v1.2.2 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE
 //
 // NEW:
+// - executionPrompt -> one-block execution text (active setup + concrete trigger/status)
+// - Included in ?mode=status and full output
+//
+// NEW:
 // - ?mode=status  -> returns a SHORT, paste-friendly JSON ("status packet")
 // - ?mode=backtest&asof=YYYY-MM-DD  -> unchanged backtest mode
 //
@@ -409,6 +413,89 @@ function buildRowsSameDayAsOf(candles5mAsc, effectiveNowMs, osloDateUsed) {
   return out;
 }
 
+// -------------------- EXECUTION PROMPT (NEW) --------------------
+function normalizeBias(x) {
+  const s = String(x || "").trim();
+  if (s === "Bullish" || s === "Bearish" || s === "Ranging") return s;
+  return "Ranging";
+}
+
+function decideDirectionFromBias(bias10) {
+  if (bias10 === "Bullish") return "UP";
+  if (bias10 === "Bearish") return "DOWN";
+  return "—";
+}
+
+function mapActiveSetup(finalObj) {
+  const play = String(finalObj?.play || "").trim();
+  if (play) return play; // keep exact play name from modules (deterministic)
+  return "NONE";
+}
+
+// Concrete trigger text: prefer final.triggerText if you add it later in modules,
+// otherwise use reason, otherwise a stable fallback.
+function mapTriggerText(finalObj) {
+  if (finalObj && typeof finalObj.triggerText === "string" && finalObj.triggerText.trim()) {
+    return finalObj.triggerText.trim();
+  }
+
+  const reason = String(finalObj?.reason || "").trim();
+  if (reason) {
+    // If the play is confirmed (trade yes), we force CONFIRMED below.
+    return reason;
+  }
+
+  return "NO VALID SETUP";
+}
+
+// Quality: if modules provide it, use it; else deterministic fallback.
+// (Overlay days often want A/B; bias days typically B by default unless you encode more.)
+function mapQuality(finalObj) {
+  const q = String(finalObj?.quality || "").trim();
+  if (q === "A" || q === "B") return q;
+
+  const play = String(finalObj?.play || "");
+  if (/overlay/i.test(play)) return "A";
+  if (play && play !== "NONE") return "B";
+  return "—";
+}
+
+function buildExecutionPrompt({ effectiveNowMs, bias10, sessions, final }) {
+  const date = effectiveNowMs != null ? getOsloDateKeyFromMs(effectiveNowMs) : "N/A";
+  const time = effectiveNowMs != null ? getOsloHHMM_fromMs(effectiveNowMs) : "N/A";
+
+  const b10 = normalizeBias(bias10);
+  const asia = sessions?.asia?.stats;
+  const asiaRange = asia?.ok ? `${asia.low.toFixed(5)} – ${asia.high.toFixed(5)}` : "N/A";
+
+  const tradeGO = final?.trade === "Yes";
+  const activeSetup = tradeGO ? mapActiveSetup(final) : mapActiveSetup(final);
+  const quality = tradeGO ? mapQuality(final) : mapQuality(final);
+
+  let triggerStatus = mapTriggerText(final);
+  if (tradeGO) triggerStatus = "CONFIRMED";
+
+  const trade = tradeGO ? "GO" : "NO";
+  const direction = tradeGO ? decideDirectionFromBias(b10) : "—";
+
+  return `
+DATE: ${date}   TIME: ${time} (Oslo)
+BIAS (10–14): ${b10}
+ASIA RANGE: ${asiaRange}
+
+ACTIVE SETUP:
+${activeSetup}
+
+TRIGGER STATUS:
+${triggerStatus}
+
+TRADE:
+${trade}
+Direction: ${direction}
+Quality: ${quality}
+`.trim();
+}
+
 // -------------------- Status builder --------------------
 function buildStatusPacket({
   ok,
@@ -426,6 +513,7 @@ function buildStatusPacket({
   sessions,
   final,
   classification,
+  executionPrompt, // NEW
 }) {
   const asia = sessions?.asia?.stats || null;
   const ff = sessions?.frankfurt?.stats || null;
@@ -451,6 +539,8 @@ function buildStatusPacket({
     bias09,
     bias10,
     londonScenario,
+
+    executionPrompt: executionPrompt || null, // NEW
 
     marketClosed: !!ctx?.marketClosed,
     weekdayOslo: ctx?.weekdayOslo || null,
@@ -632,6 +722,14 @@ module.exports = async function handler(req, res) {
         ? { type: String(final.play || "SIGNAL"), reason: String(final.reason || "signal") }
         : { type: "NO_TRADE", reason: String(final.reason || "no_signal") };
 
+    // ✅ NEW: execution prompt (one-block)
+    const executionPrompt = buildExecutionPrompt({
+      effectiveNowMs,
+      bias10,
+      sessions,
+      final,
+    });
+
     // ✅ NEW: STATUS output (short)
     if (outputMode === "status") {
       return res.status(200).json(
@@ -656,11 +754,12 @@ module.exports = async function handler(req, res) {
           sessions,
           final,
           classification,
+          executionPrompt, // NEW
         })
       );
     }
 
-    // Default: full report (unchanged, just version bumped)
+    // Default: full report (unchanged, just adds executionPrompt)
     return res.status(200).json({
       ok: true,
       version: VERSION,
@@ -676,6 +775,8 @@ module.exports = async function handler(req, res) {
       bias09,
       bias10,
       londonScenario,
+
+      executionPrompt, // NEW
 
       debug: {
         asofUsed: mode === "backtest" ? asof : null,
