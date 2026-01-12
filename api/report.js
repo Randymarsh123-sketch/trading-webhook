@@ -1,37 +1,32 @@
 // report.js
-// v1.2.2 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE
+// v1.2.3 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE (time-gated + less 429)
 //
-// NEW:
-// - executionPrompt -> one-block execution text (active setup + concrete trigger/status)
-// - Included in ?mode=status and full output
+// NEW in v1.2.3:
+// - mode=status is less 429 sensitive: fetches ONLY (1day + 5min). Skips 1h.
+// - mode=status includes time-gated fields: phase, phaseLabel, phaseGuidance, nextCheck.
+// - Keeps executionPrompt (one-block execution text) in both status + full output.
 //
-// NEW:
-// - ?mode=status  -> returns a SHORT, paste-friendly JSON ("status packet")
-// - ?mode=backtest&asof=YYYY-MM-DD  -> unchanged backtest mode
+// Existing:
+// - marketClosed/stale/weekend Friday-lock (LIVE mode)
+// - backtest: ?mode=backtest&asof=YYYY-MM-DD (engine mode)
+// - status: ?mode=status (output mode)
+// - sessions sliced in Oslo time:
+//   Asia: 02:00–06:59
+//   Frankfurt: 07:00–08:59
+//   London setup: 09:00–09:59
+//   Payoff: 10:00–13:55
 //
 // Files expected in SAME /api folder:
 // - ./daily_bias.js            (computeDailyBias)
 // - ./10_14_biasplays.js       (runBiasPlays)
 // - ./10_14_setups.js          (runSetups)
 //
-// This file:
-// - Fetches EUR/USD candles (1D/1H/5M) from TwelveData in UTC
-// - Applies marketClosed/stale/weekend Friday-lock (LIVE mode)
-// - Supports backtest mode: ?mode=backtest&asof=YYYY-MM-DD
-// - Slices sessions in Oslo time:
-//   Asia: 02:00–06:59
-//   Frankfurt: 07:00–08:59
-//   London setup: 09:00–09:59
-//   Payoff: 10:00–13:55
-// - Calls modules in locked order:
-//   daily_bias → biasplays → setups
-//
 // NOTE: All outputs are deterministic given candle data.
 
 const OSLO_TZ = "Europe/Oslo";
 const SYMBOL_TD = "EUR/USD";
 const SYMBOL_OUT = "EURUSD";
-const VERSION = "v1.2.2";
+const VERSION = "v1.2.3";
 
 const { computeDailyBias } = require("./daily_bias");
 const { runBiasPlays } = require("./10_14_biasplays");
@@ -90,7 +85,6 @@ function getOsloHHMM_fromMs(ms) {
 }
 
 function getOsloWeekday(ms) {
-  // "Monday".."Sunday"
   const dtf = new Intl.DateTimeFormat("en-US", { timeZone: OSLO_TZ, weekday: "long" });
   return dtf.format(new Date(ms));
 }
@@ -129,7 +123,6 @@ async function tdFetchSeries(interval, outputsize) {
   }
 
   const values = Array.isArray(j.values) ? j.values : [];
-  // TwelveData returns newest-first; reverse for ascending time
   const candles = values
     .map((c) => ({
       datetime: c.datetime,
@@ -141,10 +134,7 @@ async function tdFetchSeries(interval, outputsize) {
     .filter((c) => c.datetime && Number.isFinite(c.high) && Number.isFinite(c.low))
     .reverse();
 
-  return {
-    meta: j.meta || null,
-    candles,
-  };
+  return { meta: j.meta || null, candles };
 }
 
 // -------------------- Optional Upstash KV write (best-effort) --------------------
@@ -171,7 +161,6 @@ async function kvSetJson(key, valueObj) {
 
 // -------------------- Session slicing (Oslo time windows) --------------------
 function sliceSessionRows(rowsSameDay, startHHMM, endHHMMInclusive) {
-  // rowsSameDay already has osloHHMM
   return rowsSameDay.filter((r) => r.osloHHMM >= startHHMM && r.osloHHMM <= endHHMMInclusive);
 }
 
@@ -226,28 +215,24 @@ function buildSessions(rowsSameDay) {
 
 // -------------------- Daily candle selection --------------------
 function getDailyDateKey(candle) {
-  // TwelveData daily candle datetime is often "YYYY-MM-DD"
   const s = String(candle?.datetime || "").trim();
   if (!s) return null;
   if (s.includes(" ")) return s.slice(0, 10);
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  // ISO fallback
   const ms = parseUtcDatetimeToMs(s);
   return ms ? new Date(ms).toISOString().slice(0, 10) : null;
 }
 
 function pickD1D2(dailyCandlesAsc, asofDate, osloDateUsed) {
-  // dailyCandlesAsc in ascending time
   const arr = dailyCandlesAsc || [];
   if (arr.length < 2) return { ok: false, reason: "not_enough_daily_candles" };
 
-  const dateTarget = asofDate || osloDateUsed; // we treat these as YYYY-MM-DD
+  const dateTarget = asofDate || osloDateUsed;
   const dateTargetStr = String(dateTarget || "").trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateTargetStr)) {
     return { ok: false, reason: "invalid_target_date", dateTargetStr };
   }
 
-  // find last candle with dateKey <= target
   let idx = -1;
   for (let i = 0; i < arr.length; i++) {
     const dk = getDailyDateKey(arr[i]);
@@ -274,8 +259,6 @@ function computeLast5mUtc(candles5mAsc) {
 }
 
 function detectFridayLockMs(candles5mAsc) {
-  // We "hard-lock" live weekend to the last candle that is Friday (Oslo),
-  // ideally near 23:55 Oslo, but we simply pick the latest candle whose Oslo weekday is Friday.
   if (!Array.isArray(candles5mAsc) || candles5mAsc.length === 0) return null;
 
   let bestMs = null;
@@ -302,18 +285,16 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
   const weekdayLastCandleOslo = last5mMs ? getOsloWeekday(last5mMs) : null;
   const weekendByLastCandle = weekdayLastCandleOslo ? isWeekendWeekdayName(weekdayLastCandleOslo) : false;
 
-  // stale gap is measured from server time to last candle time
   const staleGapMinutes =
     Number.isFinite(last5mMs) ? Math.max(0, (nowServerMs - last5mMs) / 60000) : null;
 
   const staleThreshold = Number(staleThresholdMinutes || 60);
 
   if (mode === "backtest") {
-    // Backtest: effectiveNow is forced to 13:55 Oslo on asof date (or current Oslo date fallback)
     const asofStr = String(asof || "").trim();
-    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
+    const targetDate =
+      /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
 
-    // Pick last candle whose OsloDate == targetDate and osloHHMM <= 13:55
     let best = null;
     for (const c of candles5mAsc) {
       const ms = parseUtcDatetimeToMs(c.datetime);
@@ -342,8 +323,6 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
     };
   }
 
-  // LIVE mode:
-  // If weekend (by server OR by last candle), lock to Friday and mark marketClosed.
   if (weekendByServer || weekendByLastCandle) {
     const fridayLockMs = detectFridayLockMs(candles5mAsc);
     if (fridayLockMs != null) {
@@ -368,7 +347,6 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
     marketClosed = true;
   }
 
-  // If stale beyond threshold, treat as closed
   if (staleGapMinutes != null && staleGapMinutes > staleThreshold) {
     marketClosed = true;
   }
@@ -413,7 +391,7 @@ function buildRowsSameDayAsOf(candles5mAsc, effectiveNowMs, osloDateUsed) {
   return out;
 }
 
-// -------------------- EXECUTION PROMPT (NEW) --------------------
+// -------------------- EXECUTION PROMPT --------------------
 function normalizeBias(x) {
   const s = String(x || "").trim();
   if (s === "Bullish" || s === "Bearish" || s === "Ranging") return s;
@@ -428,28 +406,19 @@ function decideDirectionFromBias(bias10) {
 
 function mapActiveSetup(finalObj) {
   const play = String(finalObj?.play || "").trim();
-  if (play) return play; // keep exact play name from modules (deterministic)
+  if (play) return play;
   return "NONE";
 }
 
-// Concrete trigger text: prefer final.triggerText if you add it later in modules,
-// otherwise use reason, otherwise a stable fallback.
 function mapTriggerText(finalObj) {
   if (finalObj && typeof finalObj.triggerText === "string" && finalObj.triggerText.trim()) {
     return finalObj.triggerText.trim();
   }
-
   const reason = String(finalObj?.reason || "").trim();
-  if (reason) {
-    // If the play is confirmed (trade yes), we force CONFIRMED below.
-    return reason;
-  }
-
+  if (reason) return reason;
   return "NO VALID SETUP";
 }
 
-// Quality: if modules provide it, use it; else deterministic fallback.
-// (Overlay days often want A/B; bias days typically B by default unless you encode more.)
 function mapQuality(finalObj) {
   const q = String(finalObj?.quality || "").trim();
   if (q === "A" || q === "B") return q;
@@ -469,11 +438,15 @@ function buildExecutionPrompt({ effectiveNowMs, bias10, sessions, final }) {
   const asiaRange = asia?.ok ? `${asia.low.toFixed(5)} – ${asia.high.toFixed(5)}` : "N/A";
 
   const tradeGO = final?.trade === "Yes";
-  const activeSetup = tradeGO ? mapActiveSetup(final) : mapActiveSetup(final);
-  const quality = tradeGO ? mapQuality(final) : mapQuality(final);
+  const activeSetup = mapActiveSetup(final);
+  const quality = mapQuality(final);
 
   let triggerStatus = mapTriggerText(final);
-  if (tradeGO) triggerStatus = "CONFIRMED";
+  if (tradeGO) {
+    // Keep reason visible (useful) but still deterministic
+    const reason = String(final?.reason || "").trim();
+    triggerStatus = reason ? `CONFIRMED — ${reason}` : "CONFIRMED";
+  }
 
   const trade = tradeGO ? "GO" : "NO";
   const direction = tradeGO ? decideDirectionFromBias(b10) : "—";
@@ -496,6 +469,65 @@ Quality: ${quality}
 `.trim();
 }
 
+// -------------------- Time-gated phase (for status) --------------------
+function getPhaseFromOsloHHMM(hhmm) {
+  if (!hhmm || typeof hhmm !== "string") {
+    return { phase: "UNKNOWN", phaseLabel: "Unknown", phaseGuidance: "No guidance.", nextCheck: null };
+  }
+
+  if (hhmm < "02:00") {
+    return {
+      phase: "PRE_ASIA",
+      phaseLabel: "Pre-Asia",
+      phaseGuidance: "Ingen handling. Systemet er designet for London 10–14.",
+      nextCheck: "Sjekk igjen etter 07:05 for Frankfurt-data.",
+    };
+  }
+
+  if (hhmm < "07:00") {
+    return {
+      phase: "ASIA",
+      phaseLabel: "Asia pågår (02:00–06:59)",
+      phaseGuidance: "Kun kontekst. Ingen entries. Logg Asia-range og struktur.",
+      nextCheck: "Sjekk igjen etter 07:05 (Frankfurt åpnet).",
+    };
+  }
+
+  if (hhmm < "09:00") {
+    return {
+      phase: "FRANKFURT",
+      phaseLabel: "Frankfurt pågår (07:00–08:59)",
+      phaseGuidance: "Kun kontekst. Ingen entries. Følg test av Asia high/low.",
+      nextCheck: "Sjekk igjen 09:05–09:15 (London setup starter).",
+    };
+  }
+
+  if (hhmm < "10:00") {
+    return {
+      phase: "LONDON_SETUP",
+      phaseLabel: "London setup (09:00–09:59)",
+      phaseGuidance: "KUN kvalifisering. Ingen entries før 10:00. Se etter sweep/return og clean structure.",
+      nextCheck: "Sjekk igjen 09:45–09:59 før payoff åpner.",
+    };
+  }
+
+  if (hhmm < "14:00") {
+    return {
+      phase: "PAYOFF",
+      phaseLabel: "Payoff (10:00–14:00)",
+      phaseGuidance: "Execution-vindu. Ikke let etter nye setups. Følg kun aktivt signal.",
+      nextCheck: "Sjekk igjen rundt 13:50–13:55 (end-of-window).",
+    };
+  }
+
+  return {
+    phase: "POST_PAYOFF",
+    phaseLabel: "Etter payoff (etter 14:00)",
+    phaseGuidance: "Ingen nye trades. Klassifiser dagen og logg outcome.",
+    nextCheck: "Kjør backtest/klassifisering om ønskelig.",
+  };
+}
+
 // -------------------- Status builder --------------------
 function buildStatusPacket({
   ok,
@@ -513,25 +545,33 @@ function buildStatusPacket({
   sessions,
   final,
   classification,
-  executionPrompt, // NEW
+  executionPrompt,
 }) {
   const asia = sessions?.asia?.stats || null;
   const ff = sessions?.frankfurt?.stats || null;
   const ld = sessions?.londonSetup?.stats || null;
   const po = sessions?.payoff?.stats || null;
 
-  // Pull out LondonFirstSweep details if present
   const lfs = final?.play === "LondonFirstSweep" ? final?.debug?.sweep || null : null;
+
+  const hhmm = effectiveNowOslo && effectiveNowOslo.length >= 16 ? effectiveNowOslo.slice(11, 16) : null;
+  const phaseObj = getPhaseFromOsloHHMM(hhmm);
 
   return {
     ok: !!ok,
     mode: "status",
     version,
     symbol,
-    engineMode: mode, // live/backtest
+    engineMode: mode,
+
     last5mUtc,
     effectiveNowUtc,
     effectiveNowOslo,
+
+    phase: phaseObj.phase,
+    phaseLabel: phaseObj.phaseLabel,
+    phaseGuidance: phaseObj.phaseGuidance,
+    nextCheck: phaseObj.nextCheck,
 
     trade,
     play: final?.play || null,
@@ -540,7 +580,7 @@ function buildStatusPacket({
     bias10,
     londonScenario,
 
-    executionPrompt: executionPrompt || null, // NEW
+    executionPrompt: executionPrompt || null,
 
     marketClosed: !!ctx?.marketClosed,
     weekdayOslo: ctx?.weekdayOslo || null,
@@ -562,7 +602,7 @@ function buildStatusPacket({
       ? {
           levelName: lfs.levelName ?? null,
           level: lfs.level ?? null,
-          sweepSide: lfs.sweepSide ?? null, // UP sweep => expect down; DOWN sweep => expect up
+          sweepSide: lfs.sweepSide ?? null,
           sweepPips: lfs.sweepPips ?? null,
           extreme: lfs.extreme ?? null,
           osloHHMM: lfs.osloHHMM ?? null,
@@ -579,29 +619,43 @@ module.exports = async function handler(req, res) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const asof = url.searchParams.get("asof"); // YYYY-MM-DD
 
-    // IMPORTANT:
-    // We reuse ?mode=status without breaking existing behavior:
-    // - engineMode: backtest/live
-    // - outputMode: status/full
+    // outputMode: status/full
+    // engine mode: backtest/live
     const modeParam = url.searchParams.get("mode") || "";
     const outputMode = modeParam === "status" ? "status" : "full";
     const mode = modeParam === "backtest" ? "backtest" : "live";
 
-    // Fetch candles (sizes chosen for safety)
-    const [d1Resp, h1Resp, m5Resp] = await Promise.all([
-      tdFetchSeries("1day", 500),
-      tdFetchSeries("1h", 2000),
-      tdFetchSeries("5min", 5000),
-    ]);
+    // ✅ Less 429-sensitive:
+    // - status: fetch ONLY (1day + 5min)
+    // - full: fetch (1day + 1h + 5min)
+    let d1Resp, h1Resp, m5Resp;
+
+    if (outputMode === "status") {
+      const [d1, m5] = await Promise.all([tdFetchSeries("1day", 500), tdFetchSeries("5min", 5000)]);
+      d1Resp = d1;
+      m5Resp = m5;
+      h1Resp = { candles: [] }; // deterministic stub
+    } else {
+      const [d1, h1, m5] = await Promise.all([
+        tdFetchSeries("1day", 500),
+        tdFetchSeries("1h", 2000),
+        tdFetchSeries("5min", 5000),
+      ]);
+      d1Resp = d1;
+      h1Resp = h1;
+      m5Resp = m5;
+    }
 
     const dailyCandles = d1Resp.candles;
     const h1Candles = h1Resp.candles;
     const m5Candles = m5Resp.candles;
 
-    // Best-effort store (non-blocking for logic correctness)
+    // Best-effort store
     kvSetJson(`candles:${SYMBOL_OUT}:1D`, dailyCandles);
-    kvSetJson(`candles:${SYMBOL_OUT}:1H`, h1Candles);
     kvSetJson(`candles:${SYMBOL_OUT}:5M`, m5Candles);
+    if (outputMode !== "status") {
+      kvSetJson(`candles:${SYMBOL_OUT}:1H`, h1Candles);
+    }
 
     // Effective now
     const eff = computeEffectiveNow({
@@ -616,14 +670,13 @@ module.exports = async function handler(req, res) {
       effectiveNowMs != null ? getOsloDateKeyFromMs(effectiveNowMs) : getOsloDateKeyFromMs(Date.now());
     const weekdayOslo = effectiveNowMs != null ? getOsloWeekday(effectiveNowMs) : getOsloWeekday(Date.now());
 
-    // Build rows for the day AS-OF effectiveNow
+    // Build rows for day as-of effectiveNow
     const rowsSameDay = buildRowsSameDayAsOf(m5Candles, effectiveNowMs, osloDateUsed);
     const sessions = buildSessions(rowsSameDay);
 
     // Pick D-1/D-2
     const pick = pickD1D2(dailyCandles, mode === "backtest" ? asof : null, osloDateUsed);
     if (!pick.ok) {
-      // In status mode, still return a short packet
       if (outputMode === "status") {
         return res.status(200).json({
           ok: false,
@@ -632,12 +685,7 @@ module.exports = async function handler(req, res) {
           symbol: SYMBOL_OUT,
           engineMode: mode,
           error: "daily_pick_failed",
-          debug: {
-            asofUsed: mode === "backtest" ? asof : null,
-            osloDateUsed,
-            weekdayOslo,
-            pick,
-          },
+          debug: { asofUsed: mode === "backtest" ? asof : null, osloDateUsed, weekdayOslo, pick },
         });
       }
 
@@ -653,7 +701,12 @@ module.exports = async function handler(req, res) {
           osloDateUsed,
           weekdayOslo,
           pick,
-          counts: { d1: dailyCandles.length, h1: h1Candles.length, m5: m5Candles.length, m5SameDay: rowsSameDay.length },
+          counts: {
+            d1: dailyCandles.length,
+            h1: h1Candles.length,
+            m5: m5Candles.length,
+            m5SameDay: rowsSameDay.length,
+          },
         },
       });
     }
@@ -661,7 +714,6 @@ module.exports = async function handler(req, res) {
     const D_1 = pick.d1;
     const D_2 = pick.d2;
 
-    // Daily bias computation
     const daily = computeDailyBias(D_1, D_2);
     if (!daily.ok) {
       if (outputMode === "status") {
@@ -696,8 +748,6 @@ module.exports = async function handler(req, res) {
       rowsSameDay,
       weekdayOslo,
       marketClosed: !!eff.marketClosed,
-
-      // extra (for status)
       osloDateUsed,
     };
 
@@ -706,23 +756,19 @@ module.exports = async function handler(req, res) {
     let final = biasPlay;
 
     if (biasPlay.trade !== "Yes") {
-      const setup = runSetups(daily, sessions, ctx);
-      final = setup; // keep setup response (gives reasons)
+      final = runSetups(daily, sessions, ctx);
     }
 
-    // Ensure outputs are clean
     const trade = final.trade === "Yes" ? "Yes" : "No";
     const bias09 = String(final.bias09 || daily.bias09 || daily.baseBias || "Ranging");
     const bias10 = String(final.bias10 || daily.bias10 || daily.baseBias || "Ranging");
     const londonScenario = String(final.londonScenario || "no trade (messy day)");
 
-    // Classification object (simple)
     const classification =
       trade === "Yes"
         ? { type: String(final.play || "SIGNAL"), reason: String(final.reason || "signal") }
         : { type: "NO_TRADE", reason: String(final.reason || "no_signal") };
 
-    // ✅ NEW: execution prompt (one-block)
     const executionPrompt = buildExecutionPrompt({
       effectiveNowMs,
       bias10,
@@ -730,7 +776,6 @@ module.exports = async function handler(req, res) {
       final,
     });
 
-    // ✅ NEW: STATUS output (short)
     if (outputMode === "status") {
       return res.status(200).json(
         buildStatusPacket({
@@ -745,21 +790,15 @@ module.exports = async function handler(req, res) {
           bias09,
           bias10,
           londonScenario,
-          ctx: {
-            ...ctx,
-            marketClosed: !!eff.marketClosed,
-            weekdayOslo,
-            osloDateUsed,
-          },
+          ctx: { ...ctx, marketClosed: !!eff.marketClosed, weekdayOslo, osloDateUsed },
           sessions,
           final,
           classification,
-          executionPrompt, // NEW
+          executionPrompt,
         })
       );
     }
 
-    // Default: full report (unchanged, just adds executionPrompt)
     return res.status(200).json({
       ok: true,
       version: VERSION,
@@ -776,7 +815,7 @@ module.exports = async function handler(req, res) {
       bias10,
       londonScenario,
 
-      executionPrompt, // NEW
+      executionPrompt,
 
       debug: {
         asofUsed: mode === "backtest" ? asof : null,
@@ -814,7 +853,6 @@ module.exports = async function handler(req, res) {
           m5SameDay: rowsSameDay.length,
         },
 
-        // Module debug for backtest analysis (kept deterministic)
         moduleDebug: {
           biasPlay: biasPlay?.debug || null,
           biasPlayReason: biasPlay?.reason || null,
