@@ -1,32 +1,33 @@
 // report.js
-// v1.2.4 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE (time-gated + less 429)
+// v1.2.5 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE
 //
-// NEW in v1.2.4:
-// - Status-mal flyttet ut i egen fil: ./StatusMal.js
-// - report.js bygger fortsatt executionPrompt, men via buildStatusMal()
+// NEW in v1.2.5:
+// - Supports deterministic "as-of time" via query params:
+//   ?mode=status&asof=YYYY-MM-DD&at=HH:MM
+//   Example:
+//   https://trading-webhook-eight.vercel.app/api/report?mode=status&asof=2026-01-16&at=09:00
 //
-// Existing:
-// - marketClosed/stale/weekend Friday-lock (LIVE mode)
-// - backtest: ?mode=backtest&asof=YYYY-MM-DD (engine mode)
-// - status: ?mode=status (output mode)
-// - sessions sliced in Oslo time:
+// Notes:
+// - If (asof + at) is provided, we cut candles up to that Oslo time on that Oslo date.
+// - When at is used, marketClosed is forced false (simulation), no Friday-lock/weekend logic.
+// - All outputs deterministic given candle data.
+//
+// Sessions (Oslo time):
 //   Asia: 02:00–06:59
 //   Frankfurt: 07:00–08:59
 //   London setup: 09:00–09:59
 //   Payoff: 10:00–13:55
 //
-// Files expected in SAME /api folder:
+// Files expected in SAME /api folder (or updated require paths if you moved them):
 // - ./daily_bias.js            (computeDailyBias)
 // - ./10_14_biasplays.js       (runBiasPlays)
 // - ./10_14_setups.js          (runSetups)
 // - ./StatusMal.js             (buildStatusMal)
-//
-// NOTE: All outputs are deterministic given candle data.
 
 const OSLO_TZ = "Europe/Oslo";
 const SYMBOL_TD = "EUR/USD";
 const SYMBOL_OUT = "EURUSD";
-const VERSION = "v1.2.4";
+const VERSION = "v1.2.5";
 
 const { computeDailyBias } = require("./daily_bias");
 const { runBiasPlays } = require("./10_14_biasplays");
@@ -97,6 +98,77 @@ function isWeekendWeekdayName(weekday) {
 function toNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
+}
+
+function parseHHMM(hhmm) {
+  const s = String(hhmm || "").trim();
+  if (!/^\d{2}:\d{2}$/.test(s)) return null;
+  const hh = parseInt(s.slice(0, 2), 10);
+  const mm = parseInt(s.slice(3, 5), 10);
+  if (!(hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59)) return null;
+  return { hh, mm, s };
+}
+
+function parseYYYYMMDD(dateStr) {
+  const s = String(dateStr || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const Y = parseInt(s.slice(0, 4), 10);
+  const M = parseInt(s.slice(5, 7), 10);
+  const D = parseInt(s.slice(8, 10), 10);
+  if (![Y, M, D].every(Number.isFinite)) return null;
+  return { Y, M, D, s };
+}
+
+// Get timezone offset minutes for OSLO at a given UTC ms (e.g. GMT+1 => +60)
+function getOsloOffsetMinutesAtUtcMs(msUtc) {
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone: OSLO_TZ,
+      timeZoneName: "shortOffset",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    });
+    const parts = dtf.formatToParts(new Date(msUtc));
+    const tz = parts.find((p) => p.type === "timeZoneName")?.value || "";
+    // Examples: "GMT+1", "GMT+2", "UTC", "GMT-5"
+    const m = tz.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/i);
+    if (!m) {
+      if (/UTC/i.test(tz) || /GMT/i.test(tz)) return 0;
+      return null;
+    }
+    const sign = m[1] === "-" ? -1 : 1;
+    const hh = parseInt(m[2], 10);
+    const mm = m[3] ? parseInt(m[3], 10) : 0;
+    return sign * (hh * 60 + mm);
+  } catch {
+    return null;
+  }
+}
+
+// Convert an Oslo local datetime (YYYY-MM-DD + HH:MM) to a UTC ms timestamp.
+function osloLocalToUtcMs(dateStr, hhmmStr) {
+  const d = parseYYYYMMDD(dateStr);
+  const t = parseHHMM(hhmmStr);
+  if (!d || !t) return null;
+
+  // Initial naive UTC guess
+  let guessUtc = Date.UTC(d.Y, d.M - 1, d.D, t.hh, t.mm, 0);
+
+  // Offset at guess
+  const off1 = getOsloOffsetMinutesAtUtcMs(guessUtc);
+  if (off1 == null) return null;
+
+  // Adjust guess
+  let utcMs = Date.UTC(d.Y, d.M - 1, d.D, t.hh, t.mm, 0) - off1 * 60000;
+
+  // Re-check offset (DST boundary safety)
+  const off2 = getOsloOffsetMinutesAtUtcMs(utcMs);
+  if (off2 != null && off2 !== off1) {
+    utcMs = Date.UTC(d.Y, d.M - 1, d.D, t.hh, t.mm, 0) - off2 * 60000;
+  }
+
+  return utcMs;
 }
 
 // -------------------- TwelveData fetch --------------------
@@ -252,7 +324,7 @@ function pickD1D2(dailyCandlesAsc, asofDate, osloDateUsed) {
   };
 }
 
-// -------------------- Effective now / marketClosed / Friday-lock --------------------
+// -------------------- Effective now (live) / Friday-lock --------------------
 function computeLast5mUtc(candles5mAsc) {
   if (!Array.isArray(candles5mAsc) || candles5mAsc.length === 0) return null;
   const last = candles5mAsc[candles5mAsc.length - 1];
@@ -272,7 +344,7 @@ function detectFridayLockMs(candles5mAsc) {
   return bestMs;
 }
 
-function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }) {
+function computeEffectiveNowLive({ candles5mAsc, staleThresholdMinutes }) {
   const last5mUtc = computeLast5mUtc(candles5mAsc);
   const last5mMs = parseUtcDatetimeToMs(last5mUtc);
   const nowServerMs = Date.now();
@@ -289,38 +361,6 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
   const staleGapMinutes = Number.isFinite(last5mMs) ? Math.max(0, (nowServerMs - last5mMs) / 60000) : null;
   const staleThreshold = Number(staleThresholdMinutes || 60);
 
-  if (mode === "backtest") {
-    const asofStr = String(asof || "").trim();
-    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
-
-    let best = null;
-    for (const c of candles5mAsc) {
-      const ms = parseUtcDatetimeToMs(c.datetime);
-      if (ms == null) continue;
-      if (getOsloDateKeyFromMs(ms) !== targetDate) continue;
-      const hhmm = getOsloHHMM_fromMs(ms);
-      if (hhmm <= "13:55") best = ms;
-    }
-    effectiveNowMs = best ?? last5mMs;
-    marketClosed = false;
-
-    return {
-      ok: true,
-      mode,
-      last5mUtc,
-      effectiveNowUtc: effectiveNowMs ? new Date(effectiveNowMs).toISOString().replace("T", " ").slice(0, 19) : null,
-      effectiveNowOslo: effectiveNowMs ? formatMsInOslo(effectiveNowMs) : null,
-      staleGapMinutes,
-      staleThresholdMinutes: staleThreshold,
-      weekendByServer,
-      weekendByLastCandle,
-      fridayLockUtc: null,
-      fridayLockOslo: null,
-      marketClosed,
-      usedFridayLock: false,
-    };
-  }
-
   if (weekendByServer || weekendByLastCandle) {
     const fridayLockMs = detectFridayLockMs(candles5mAsc);
     if (fridayLockMs != null) {
@@ -328,7 +368,7 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
       marketClosed = true;
       return {
         ok: true,
-        mode: "live",
+        engineMode: "live",
         last5mUtc,
         effectiveNowUtc: new Date(effectiveNowMs).toISOString().replace("T", " ").slice(0, 19),
         effectiveNowOslo: formatMsInOslo(effectiveNowMs),
@@ -351,7 +391,7 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
 
   return {
     ok: true,
-    mode: "live",
+    engineMode: "live",
     last5mUtc,
     effectiveNowUtc: effectiveNowMs ? new Date(effectiveNowMs).toISOString().replace("T", " ").slice(0, 19) : null,
     effectiveNowOslo: effectiveNowMs ? formatMsInOslo(effectiveNowMs) : null,
@@ -363,6 +403,53 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
     fridayLockOslo: null,
     marketClosed,
     usedFridayLock: false,
+  };
+}
+
+// -------------------- As-of (asof + at) cutoff --------------------
+function pickEffectiveNowMsForAsOfAt(candles5mAsc, asofDate, atHHMM) {
+  const d = parseYYYYMMDD(asofDate);
+  const t = parseHHMM(atHHMM);
+  if (!d || !t) return { ok: false, reason: "invalid_asof_or_at" };
+
+  const targetUtcMs = osloLocalToUtcMs(d.s, t.s);
+  if (targetUtcMs == null) return { ok: false, reason: "cannot_compute_target_utc_ms" };
+
+  const targetDate = d.s;
+
+  let bestMs = null;
+  let bestUtcStr = null;
+
+  for (const c of candles5mAsc) {
+    const ms = parseUtcDatetimeToMs(c.datetime);
+    if (ms == null) continue;
+    if (ms > targetUtcMs) continue;
+    if (getOsloDateKeyFromMs(ms) !== targetDate) continue;
+
+    // pick latest <= target
+    bestMs = ms;
+    bestUtcStr = c.datetime;
+  }
+
+  if (bestMs == null) {
+    return {
+      ok: false,
+      reason: "no_5m_candle_found_before_cutoff",
+      targetDate,
+      atHHMM: t.s,
+    };
+  }
+
+  return {
+    ok: true,
+    engineMode: "asof_at",
+    last5mUtc: computeLast5mUtc(candles5mAsc),
+    effectiveNowUtc: bestUtcStr,
+    effectiveNowOslo: formatMsInOslo(bestMs),
+    effectiveNowMs: bestMs,
+    targetUtcMs,
+    targetOslo: `${targetDate} ${t.s}:00`,
+    marketClosed: false,
   };
 }
 
@@ -453,7 +540,7 @@ function buildStatusPacket({
   ok,
   version,
   symbol,
-  mode,
+  engineMode,
   last5mUtc,
   effectiveNowUtc,
   effectiveNowOslo,
@@ -482,7 +569,7 @@ function buildStatusPacket({
     mode: "status",
     version,
     symbol,
-    engineMode: mode,
+    engineMode,
 
     last5mUtc,
     effectiveNowUtc,
@@ -537,15 +624,16 @@ function buildStatusPacket({
 module.exports = async function handler(req, res) {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const asof = url.searchParams.get("asof"); // YYYY-MM-DD
 
-    // outputMode: status/full
-    // engine mode: backtest/live
     const modeParam = url.searchParams.get("mode") || "";
     const outputMode = modeParam === "status" ? "status" : "full";
-    const mode = modeParam === "backtest" ? "backtest" : "live";
 
-    // ✅ Less 429-sensitive:
+    const asof = url.searchParams.get("asof"); // YYYY-MM-DD
+    const at = url.searchParams.get("at");     // HH:MM (Oslo)
+
+    const wantAsOfAt = !!(asof && at);
+
+    // Fetch candles
     // - status: fetch ONLY (1day + 5min)
     // - full: fetch (1day + 1h + 5min)
     let d1Resp, h1Resp, m5Resp;
@@ -554,7 +642,7 @@ module.exports = async function handler(req, res) {
       const [d1, m5] = await Promise.all([tdFetchSeries("1day", 500), tdFetchSeries("5min", 5000)]);
       d1Resp = d1;
       m5Resp = m5;
-      h1Resp = { candles: [] }; // deterministic stub
+      h1Resp = { candles: [] };
     } else {
       const [d1, h1, m5] = await Promise.all([
         tdFetchSeries("1day", 500),
@@ -573,29 +661,68 @@ module.exports = async function handler(req, res) {
     // Best-effort store
     kvSetJson(`candles:${SYMBOL_OUT}:1D`, dailyCandles);
     kvSetJson(`candles:${SYMBOL_OUT}:5M`, m5Candles);
-    if (outputMode !== "status") {
-      kvSetJson(`candles:${SYMBOL_OUT}:1H`, h1Candles);
+    if (outputMode !== "status") kvSetJson(`candles:${SYMBOL_OUT}:1H`, h1Candles);
+
+    // Effective now selection:
+    let engineMode = "live";
+    let last5mUtc = computeLast5mUtc(m5Candles);
+    let effectiveNowUtc = null;
+    let effectiveNowOslo = null;
+    let effectiveNowMs = null;
+
+    // debug for asof+at
+    let asofAtDebug = null;
+
+    if (wantAsOfAt) {
+      const cut = pickEffectiveNowMsForAsOfAt(m5Candles, asof, at);
+      if (!cut.ok) {
+        return res.status(200).json({
+          ok: false,
+          mode: outputMode === "status" ? "status" : "full",
+          version: VERSION,
+          symbol: SYMBOL_OUT,
+          engineMode: "asof_at",
+          error: "asof_at_cut_failed",
+          debug: { asof, at, cut },
+        });
+      }
+
+      engineMode = cut.engineMode;
+      last5mUtc = cut.last5mUtc;
+      effectiveNowUtc = cut.effectiveNowUtc;
+      effectiveNowOslo = cut.effectiveNowOslo;
+      effectiveNowMs = cut.effectiveNowMs;
+
+      asofAtDebug = {
+        asof,
+        at,
+        targetOslo: cut.targetOslo,
+        targetUtcMs: cut.targetUtcMs,
+      };
+    } else {
+      const eff = computeEffectiveNowLive({
+        candles5mAsc: m5Candles,
+        staleThresholdMinutes: 60,
+      });
+
+      engineMode = eff.engineMode;
+      last5mUtc = eff.last5mUtc;
+      effectiveNowUtc = eff.effectiveNowUtc;
+      effectiveNowOslo = eff.effectiveNowOslo;
+      effectiveNowMs = parseUtcDatetimeToMs(effectiveNowUtc);
     }
 
-    // Effective now
-    const eff = computeEffectiveNow({
-      mode,
-      asof,
-      candles5mAsc: m5Candles,
-      staleThresholdMinutes: 60,
-    });
-
-    const effectiveNowMs = parseUtcDatetimeToMs(eff.effectiveNowUtc);
     const osloDateUsed =
       effectiveNowMs != null ? getOsloDateKeyFromMs(effectiveNowMs) : getOsloDateKeyFromMs(Date.now());
-    const weekdayOslo = effectiveNowMs != null ? getOsloWeekday(effectiveNowMs) : getOsloWeekday(Date.now());
+    const weekdayOslo =
+      effectiveNowMs != null ? getOsloWeekday(effectiveNowMs) : getOsloWeekday(Date.now());
 
     // Build rows for day as-of effectiveNow
     const rowsSameDay = buildRowsSameDayAsOf(m5Candles, effectiveNowMs, osloDateUsed);
     const sessions = buildSessions(rowsSameDay);
 
-    // Pick D-1/D-2
-    const pick = pickD1D2(dailyCandles, mode === "backtest" ? asof : null, osloDateUsed);
+    // Daily selection (use asof date if provided, else osloDateUsed)
+    const pick = pickD1D2(dailyCandles, wantAsOfAt ? asof : null, osloDateUsed);
     if (!pick.ok) {
       if (outputMode === "status") {
         return res.status(200).json({
@@ -603,9 +730,9 @@ module.exports = async function handler(req, res) {
           mode: "status",
           version: VERSION,
           symbol: SYMBOL_OUT,
-          engineMode: mode,
+          engineMode,
           error: "daily_pick_failed",
-          debug: { asofUsed: mode === "backtest" ? asof : null, osloDateUsed, weekdayOslo, pick },
+          debug: { asofUsed: wantAsOfAt ? asof : null, osloDateUsed, weekdayOslo, pick, asofAtDebug },
         });
       }
 
@@ -614,13 +741,14 @@ module.exports = async function handler(req, res) {
         version: VERSION,
         symbol: SYMBOL_OUT,
         timezoneRequestedFromTwelveData: "UTC",
-        mode,
+        engineMode,
         error: "daily_pick_failed",
         debug: {
-          asofUsed: mode === "backtest" ? asof : null,
+          asofUsed: wantAsOfAt ? asof : null,
           osloDateUsed,
           weekdayOslo,
           pick,
+          asofAtDebug,
           counts: {
             d1: dailyCandles.length,
             h1: h1Candles.length,
@@ -642,9 +770,9 @@ module.exports = async function handler(req, res) {
           mode: "status",
           version: VERSION,
           symbol: SYMBOL_OUT,
-          engineMode: mode,
+          engineMode,
           error: "daily_bias_failed",
-          debug: { daily },
+          debug: { daily, asofAtDebug },
         });
       }
 
@@ -653,21 +781,34 @@ module.exports = async function handler(req, res) {
         version: VERSION,
         symbol: SYMBOL_OUT,
         timezoneRequestedFromTwelveData: "UTC",
-        mode,
+        engineMode,
         error: "daily_bias_failed",
-        debug: { daily },
+        debug: { daily, asofAtDebug },
       });
     }
 
     const PDH = toNum(D_1.high);
     const PDL = toNum(D_1.low);
 
+    // marketClosed:
+    // - live mode: as per live detection (stale/weekend/friday-lock)
+    // - asof_at: forced false (simulation)
+    const marketClosed = wantAsOfAt ? false : (function () {
+      // recompute quickly from effectiveNowOslo and last candle gap is already handled in live helper;
+      // we trust live helper result by re-running it once more isn't needed.
+      // We'll infer from engineMode=live via weekday/weekend is already reflected in previous effectiveNow.
+      // If it was Friday lock/weekend, effectiveNowOslo would be Friday and it would have returned marketClosed true.
+      // BUT we didn't keep that flag here, so infer conservatively: marketClosed if weekend by server OR effectiveNow is on weekend.
+      const wd = effectiveNowMs != null ? getOsloWeekday(effectiveNowMs) : null;
+      return wd ? isWeekendWeekdayName(wd) : false;
+    })();
+
     const ctx = {
       pdh: PDH,
       pdl: PDL,
       rowsSameDay,
       weekdayOslo,
-      marketClosed: !!eff.marketClosed,
+      marketClosed,
       osloDateUsed,
     };
 
@@ -704,15 +845,15 @@ module.exports = async function handler(req, res) {
           ok: true,
           version: VERSION,
           symbol: SYMBOL_OUT,
-          mode,
-          last5mUtc: eff.last5mUtc,
-          effectiveNowUtc: eff.effectiveNowUtc,
-          effectiveNowOslo: eff.effectiveNowOslo,
+          engineMode,
+          last5mUtc,
+          effectiveNowUtc,
+          effectiveNowOslo,
           trade,
           bias09,
           bias10,
           londonScenario,
-          ctx: { ...ctx, marketClosed: !!eff.marketClosed, weekdayOslo, osloDateUsed },
+          ctx,
           sessions,
           final,
           classification,
@@ -726,11 +867,11 @@ module.exports = async function handler(req, res) {
       version: VERSION,
       symbol: SYMBOL_OUT,
       timezoneRequestedFromTwelveData: "UTC",
-      mode,
+      engineMode,
 
-      last5mUtc: eff.last5mUtc,
-      effectiveNowUtc: eff.effectiveNowUtc,
-      effectiveNowOslo: eff.effectiveNowOslo,
+      last5mUtc,
+      effectiveNowUtc,
+      effectiveNowOslo,
 
       trade,
       bias09,
@@ -740,16 +881,7 @@ module.exports = async function handler(req, res) {
       executionPrompt,
 
       debug: {
-        asofUsed: mode === "backtest" ? asof : null,
-        staleGapMinutes: eff.staleGapMinutes,
-        staleThresholdMinutes: eff.staleThresholdMinutes,
-        weekendByServer: eff.weekendByServer,
-        weekendByLastCandle: eff.weekendByLastCandle,
-        usedFridayLock: eff.usedFridayLock,
-        fridayLockUtc: eff.fridayLockUtc,
-        fridayLockOslo: eff.fridayLockOslo,
-        marketClosed: eff.marketClosed,
-
+        asofAtDebug,
         D_1: pick.d1Key,
         D_2: pick.d2Key,
         baseBias: daily.baseBias,
