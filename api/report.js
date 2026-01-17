@@ -1,10 +1,9 @@
 // report.js
-// v1.2.3 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE (time-gated + less 429)
+// v1.2.4 — REN MOTOR (orkestrator) for London 10–14 + STATUS MODE (time-gated + less 429)
 //
-// NEW in v1.2.3:
-// - mode=status is less 429 sensitive: fetches ONLY (1day + 5min). Skips 1h.
-// - mode=status includes time-gated fields: phase, phaseLabel, phaseGuidance, nextCheck.
-// - Keeps executionPrompt (one-block execution text) in both status + full output.
+// NEW in v1.2.4:
+// - Status-mal flyttet ut i egen fil: ./StatusMal.js
+// - report.js bygger fortsatt executionPrompt, men via buildStatusMal()
 //
 // Existing:
 // - marketClosed/stale/weekend Friday-lock (LIVE mode)
@@ -20,17 +19,19 @@
 // - ./daily_bias.js            (computeDailyBias)
 // - ./10_14_biasplays.js       (runBiasPlays)
 // - ./10_14_setups.js          (runSetups)
+// - ./StatusMal.js             (buildStatusMal)
 //
 // NOTE: All outputs are deterministic given candle data.
 
 const OSLO_TZ = "Europe/Oslo";
 const SYMBOL_TD = "EUR/USD";
 const SYMBOL_OUT = "EURUSD";
-const VERSION = "v1.2.3";
+const VERSION = "v1.2.4";
 
 const { computeDailyBias } = require("./daily_bias");
 const { runBiasPlays } = require("./10_14_biasplays");
 const { runSetups } = require("./10_14_setups");
+const { buildStatusMal } = require("./StatusMal");
 
 // -------------------- Time helpers --------------------
 function parseUtcDatetimeToMs(dtStr) {
@@ -285,15 +286,12 @@ function computeEffectiveNow({ mode, asof, candles5mAsc, staleThresholdMinutes }
   const weekdayLastCandleOslo = last5mMs ? getOsloWeekday(last5mMs) : null;
   const weekendByLastCandle = weekdayLastCandleOslo ? isWeekendWeekdayName(weekdayLastCandleOslo) : false;
 
-  const staleGapMinutes =
-    Number.isFinite(last5mMs) ? Math.max(0, (nowServerMs - last5mMs) / 60000) : null;
-
+  const staleGapMinutes = Number.isFinite(last5mMs) ? Math.max(0, (nowServerMs - last5mMs) / 60000) : null;
   const staleThreshold = Number(staleThresholdMinutes || 60);
 
   if (mode === "backtest") {
     const asofStr = String(asof || "").trim();
-    const targetDate =
-      /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
+    const targetDate = /^\d{4}-\d{2}-\d{2}$/.test(asofStr) ? asofStr : getOsloDateKeyFromMs(last5mMs || nowServerMs);
 
     let best = null;
     for (const c of candles5mAsc) {
@@ -389,84 +387,6 @@ function buildRowsSameDayAsOf(candles5mAsc, effectiveNowMs, osloDateUsed) {
   }
   out.sort((a, b) => a.ms - b.ms);
   return out;
-}
-
-// -------------------- EXECUTION PROMPT --------------------
-function normalizeBias(x) {
-  const s = String(x || "").trim();
-  if (s === "Bullish" || s === "Bearish" || s === "Ranging") return s;
-  return "Ranging";
-}
-
-function decideDirectionFromBias(bias10) {
-  if (bias10 === "Bullish") return "UP";
-  if (bias10 === "Bearish") return "DOWN";
-  return "—";
-}
-
-function mapActiveSetup(finalObj) {
-  const play = String(finalObj?.play || "").trim();
-  if (play) return play;
-  return "NONE";
-}
-
-function mapTriggerText(finalObj) {
-  if (finalObj && typeof finalObj.triggerText === "string" && finalObj.triggerText.trim()) {
-    return finalObj.triggerText.trim();
-  }
-  const reason = String(finalObj?.reason || "").trim();
-  if (reason) return reason;
-  return "NO VALID SETUP";
-}
-
-function mapQuality(finalObj) {
-  const q = String(finalObj?.quality || "").trim();
-  if (q === "A" || q === "B") return q;
-
-  const play = String(finalObj?.play || "");
-  if (/overlay/i.test(play)) return "A";
-  if (play && play !== "NONE") return "B";
-  return "—";
-}
-
-function buildExecutionPrompt({ effectiveNowMs, bias10, sessions, final }) {
-  const date = effectiveNowMs != null ? getOsloDateKeyFromMs(effectiveNowMs) : "N/A";
-  const time = effectiveNowMs != null ? getOsloHHMM_fromMs(effectiveNowMs) : "N/A";
-
-  const b10 = normalizeBias(bias10);
-  const asia = sessions?.asia?.stats;
-  const asiaRange = asia?.ok ? `${asia.low.toFixed(5)} – ${asia.high.toFixed(5)}` : "N/A";
-
-  const tradeGO = final?.trade === "Yes";
-  const activeSetup = mapActiveSetup(final);
-  const quality = mapQuality(final);
-
-  let triggerStatus = mapTriggerText(final);
-  if (tradeGO) {
-    // Keep reason visible (useful) but still deterministic
-    const reason = String(final?.reason || "").trim();
-    triggerStatus = reason ? `CONFIRMED — ${reason}` : "CONFIRMED";
-  }
-
-  const trade = tradeGO ? "GO" : "NO";
-  const direction = tradeGO ? decideDirectionFromBias(b10) : "—";
-
-  return `
-DATE: ${date}   TIME: ${time} (Oslo)
-BIAS (10–14): ${b10}
-ASIA RANGE: ${asiaRange}
-
-ACTIVE SETUP:
-${activeSetup}
-
-TRIGGER STATUS:
-${triggerStatus}
-
-TRADE:
-${trade}
-Direction: ${direction}
-Quality: ${quality}
-`.trim();
 }
 
 // -------------------- Time-gated phase (for status) --------------------
@@ -769,11 +689,13 @@ module.exports = async function handler(req, res) {
         ? { type: String(final.play || "SIGNAL"), reason: String(final.reason || "signal") }
         : { type: "NO_TRADE", reason: String(final.reason || "no_signal") };
 
-    const executionPrompt = buildExecutionPrompt({
+    const executionPrompt = buildStatusMal({
       effectiveNowMs,
       bias10,
       sessions,
       final,
+      getOsloDateKeyFromMs,
+      getOsloHHMM_fromMs,
     });
 
     if (outputMode === "status") {
